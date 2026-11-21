@@ -98,6 +98,7 @@ impl RepoTab {
             if theme::tool_button(ui, icon::GET_LATEST, "Get Latest", !busy, badge, &tip).clicked() {
                 actions.push(Action::GetLatest);
             }
+            self.bin_toolbar(ui, actions);
             ui.separator();
             let label = if cl == DEFAULT_ID { "Submit".to_string() } else { format!("Submit #{cl}") };
             if theme::tool_button(
@@ -240,6 +241,7 @@ impl RepoTab {
             conflicts: s.conflicts().count(),
             no_files: s.files.is_empty(),
         });
+        self.bin_banners(ui, actions);
         let Some(st) = facts else {
             if let Some(e) = &self.status_err {
                 theme::banner(ui, RED, |ui| {

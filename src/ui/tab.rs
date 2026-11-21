@@ -35,6 +35,8 @@ pub struct TreeData {
 pub struct FetchData {
     pub remote: Option<String>,
     pub incoming: Vec<(char, String)>,
+    /// Build state for repositories that use precompiled binaries.
+    pub binaries: Option<crate::binaries::BinStatus>,
 }
 
 pub struct RefsData {
@@ -110,6 +112,7 @@ pub enum OpOk {
         shelf: Shelf,
         sync: SyncOutcome,
     },
+    Binaries(crate::binaries::BinSyncOutcome),
 }
 
 pub enum Msg {
@@ -169,6 +172,9 @@ pub enum Action {
     Refresh,
     Fetch,
     GetLatest,
+    /// Answer to the binaries trust prompt.
+    TrustBinaries(bool),
+    LaunchEditor,
     ShelveOverlapAndSync(Vec<String>),
     Push,
     ShowDiff(DiffTarget),
@@ -218,11 +224,30 @@ pub enum Action {
     SetupIdentity,
     AddRemote,
     TrackLfs(String),
-    Confirm { title: String, body: String, action: Box<Action> },
+    Confirm {
+        title: String,
+        body: String,
+        action: Box<Action>,
+    },
     // Confirmed / dialog-produced actions:
-    DoSubmit { paths: Vec<String>, message: String, cl_id: u32, push: bool, unlock: Vec<String> },
-    DoShelve { paths: Vec<String>, description: String, revert: bool, share: bool, cl_id: Option<u32> },
-    DoUnshelve { shelf: Shelf, paths: Vec<String> },
+    DoSubmit {
+        paths: Vec<String>,
+        message: String,
+        cl_id: u32,
+        push: bool,
+        unlock: Vec<String>,
+    },
+    DoShelve {
+        paths: Vec<String>,
+        description: String,
+        revert: bool,
+        share: bool,
+        cl_id: Option<u32>,
+    },
+    DoUnshelve {
+        shelf: Shelf,
+        paths: Vec<String>,
+    },
     RestoreWip(Shelf),
     DoRevert(Vec<String>),
     DoDeleteShelf(Shelf),
@@ -270,6 +295,7 @@ pub enum Dialog {
     NewBranch { name: String, start: Option<String>, switch: bool },
     SwitchDirty(SwitchTarget),
     SyncBlocked(Vec<String>),
+    TrustBinaries(crate::binaries::LoadedConfig),
     Confirm { title: String, body: String, action: Action },
     NewTag { rev: String, name: String, message: String, push: bool },
     AddRemote { name: String, url: String },
@@ -315,8 +341,10 @@ pub struct RepoTab {
     pub title: String,
     /// Path inside the parent repository when opened as a submodule tab.
     pub parent: Option<String>,
-    local: Worker<Msg>,
+    pub(super) local: Worker<Msg>,
     net: Worker<Msg>,
+    /// Precompiled binaries (only for repositories with `.g4v/binaries.toml`).
+    pub bin: super::binaries::BinUi,
 
     pub status: Option<StatusSnapshot>,
     pub status_err: Option<String>,
@@ -492,6 +520,7 @@ impl RepoTab {
             collapsed_cls: HashSet::new(),
             identity: repo.identity(),
             remote: repo.default_remote(),
+            bin: super::binaries::BinUi::load(repo.root()),
             repo,
         };
         if let Some(e) = tab.changelists.load_error.clone() {
@@ -524,6 +553,9 @@ impl RepoTab {
     }
 
     pub fn busy_label(&self) -> Option<String> {
+        if let Some(p) = self.bin.progress_line() {
+            return Some(p);
+        }
         self.local.current().filter(|c| c != "status").or_else(|| self.net.current().filter(|c| c != "Checking server"))
     }
 
@@ -655,6 +687,8 @@ impl RepoTab {
     // ------------------------------------------------------------ requests
 
     pub fn refresh_all(&mut self) {
+        let root = self.repo.root().to_path_buf();
+        self.bin.reload(&root);
         self.request_status(true);
         self.tree_stale = true;
         self.request_tree();
@@ -745,11 +779,13 @@ impl RepoTab {
             return;
         }
         self.fetch_inflight = true;
-        self.net.submit("Checking server", |r| {
+        let bin_cfg = self.bin.active().cloned();
+        self.net.submit("Checking server", move |r| {
             Msg::Fetched((|| {
                 let remote = r.fetch().map_err(es)?;
                 let incoming = r.incoming_changes().map_err(es)?;
-                Ok(FetchData { remote, incoming })
+                let binaries = bin_cfg.and_then(|c| super::binaries::status_after_fetch(r, &c, remote.as_deref()));
+                Ok(FetchData { remote, incoming, binaries })
             })())
         });
         self.request_locks();
@@ -849,6 +885,7 @@ impl RepoTab {
                     Ok(f) => {
                         self.fetch_err = None;
                         self.remote = f.remote;
+                        self.bin.status = f.binaries;
                         let new: HashMap<String, char> = f.incoming.into_iter().map(|(c, p)| (p, c)).collect();
                         let changed = new != self.incoming;
                         self.incoming = new;
@@ -1072,6 +1109,7 @@ impl RepoTab {
         match ok {
             OpOk::Message(m) => self.toast(m),
             OpOk::Sync(outcome) => self.on_sync(outcome),
+            OpOk::Binaries(outcome) => self.bin_on_done(outcome),
             OpOk::Submitted { commit, cl, cl_id, push, unlocked, unlock_failed } => {
                 // The change is committed, so the typed description is no longer needed.
                 self.submit_draft = None;
@@ -1149,7 +1187,7 @@ impl RepoTab {
         let _ = settings;
     }
 
-    fn on_sync(&mut self, outcome: SyncOutcome) {
+    pub(super) fn on_sync(&mut self, outcome: SyncOutcome) {
         match outcome {
             SyncOutcome::UpToDate => self.toast("You already have the latest version."),
             SyncOutcome::Updated { commits } => self.toast(format!("Got latest: {commits} new change(s) from the server.")),
@@ -1178,12 +1216,17 @@ impl RepoTab {
                     self.error("Finish resolving the current conflicts first (Pending tab).");
                     return;
                 }
+                if self.bin_get_latest(settings) {
+                    return;
+                }
                 let mode = settings.pull_mode;
                 self.local.submit("Getting latest", move |r| {
                     let dirty: Vec<String> = r.status().map(|s| s.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
                     Msg::Done { title: "Get Latest".into(), result: r.sync(mode, &dirty).map(OpOk::Sync).map_err(es), net: false }
                 });
             }
+            Action::TrustBinaries(trusted) => self.bin_set_trust(trusted, settings),
+            Action::LaunchEditor => self.bin_launch(),
             Action::ShelveOverlapAndSync(paths) => {
                 let mode = settings.pull_mode;
                 let branch = self.branch_name();

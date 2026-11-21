@@ -1,5 +1,6 @@
 //! The g4v desktop application (egui).
 
+mod binaries;
 mod detail;
 mod dialogs;
 pub mod tab;
@@ -306,6 +307,8 @@ impl G4vApp {
         let Some(mut dlg) = self.dialog.take() else { return };
         let mut keep = true;
         let mut open_after: Option<PathBuf> = None;
+        // A fresh clone of a project that ships binaries gets its editor installed straight away.
+        let mut after_clone = false;
         let mut next: Option<GlobalDialog> = None;
         let resp = egui::Modal::new(egui::Id::unique("g4v_global_dialog")).show(ctx, |ui| {
             ui.set_width(540.0);
@@ -381,6 +384,7 @@ impl G4vApp {
                     match rx.try_recv() {
                         Ok(Ok(p)) => {
                             open_after = Some(p);
+                            after_clone = true;
                             keep = false;
                         }
                         Ok(Err(e)) => next = Some(GlobalDialog::Error(format!("Clone failed:\n{e}"))),
@@ -527,6 +531,12 @@ impl G4vApp {
         }
         if let Some(p) = open_after {
             self.open_repo(ctx, p, None, true);
+            if after_clone {
+                let settings = self.settings.clone();
+                if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| t.bin.cfg.is_some()) {
+                    tab.handle(tab::Action::GetLatest, &settings);
+                }
+            }
         }
     }
 

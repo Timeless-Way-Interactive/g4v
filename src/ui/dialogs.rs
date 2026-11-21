@@ -437,6 +437,11 @@ impl RepoTab {
                     return Outcome::Close;
                 }
             }
+            Dialog::TrustBinaries(cfg) => {
+                if RepoTab::bin_trust_dialog(ui, cfg, actions) {
+                    return Outcome::Close;
+                }
+            }
             Dialog::SyncBlocked(overlap) => {
                 ui.heading(format!("{} Get Latest needs your attention", icon::WARN));
                 ui.label("These files have local edits AND newer versions on the server. Getting latest would overwrite your edits, so g4v stopped:");

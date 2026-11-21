@@ -3,6 +3,7 @@
 //! The crate is split into a UI-free backend (`git`, `changelists`,
 //! `settings`, `worker`) that is fully testable, and the egui front end (`ui`).
 
+pub mod binaries;
 pub mod changelists;
 pub mod git;
 pub mod settings;
