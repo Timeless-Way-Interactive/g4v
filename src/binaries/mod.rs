@@ -18,7 +18,9 @@
 //! * [`install`] — download, verify, stage and swap files in, with a crash-safe transaction and rollback
 //! * [`trust`]   — the user's per-repository decision to let a repo install files and run its commands
 //! * [`sync`]    — Get Latest, put together
+//! * [`builder`] — a build running on this machine (the loading bar on CI runners)
 
+pub mod builder;
 pub mod config;
 pub mod install;
 pub mod notes;

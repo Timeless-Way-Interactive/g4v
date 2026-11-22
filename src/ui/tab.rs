@@ -174,6 +174,8 @@ pub enum Action {
     GetLatest,
     /// Answer to the binaries trust prompt.
     TrustBinaries(bool),
+    /// The "set up" banner: ask for trust without starting a Get Latest.
+    SetUpBinaries,
     LaunchEditor,
     ShelveOverlapAndSync(Vec<String>),
     Push,
@@ -844,6 +846,7 @@ impl RepoTab {
                 self.request_fetch();
             }
         }
+        self.bin.tick(ctx, self.repo.root());
         self.toasts.retain(|t| t.error || t.created.elapsed() < Duration::from_secs(6));
         ctx.request_repaint_after(Duration::from_millis(if focused { 1000 } else { 5000 }));
     }
@@ -1226,6 +1229,7 @@ impl RepoTab {
                 });
             }
             Action::TrustBinaries(trusted) => self.bin_set_trust(trusted, settings),
+            Action::SetUpBinaries => self.bin_set_up(),
             Action::LaunchEditor => self.bin_launch(),
             Action::ShelveOverlapAndSync(paths) => {
                 let mode = settings.pull_mode;

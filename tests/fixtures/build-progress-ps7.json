@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "repo": "Timeless-Way-Interactive/Delta-x-Dungeon-Breaker",
+  "pid": 29840,
+  "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "key": null,
+  "state": "failed",
+  "started": 1795332688,
+  "updated": 1795332688,
+  "phase": "editor",
+  "phase_label": "Compiling the editor",
+  "phase_index": 3,
+  "phase_count": 6,
+  "detail": "compile error",
+  "fraction": 0.0137,
+  "eta_seconds": 7,
+  "waiting": 0
+}
