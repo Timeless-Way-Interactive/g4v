@@ -15,6 +15,7 @@ winresource = "0.1"
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3

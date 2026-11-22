@@ -1,6 +1,7 @@
 //! g4v Windows installer / uninstaller.
 //!
-//! A single self-contained executable that embeds `g4v.exe`. It installs per user
+//! A single self-contained executable that embeds `g4v.exe` and, appended to its end, a zip of the Git that g4v
+//! uses (MinGit with Git Credential Manager, plus Git LFS; see installer/build.ps1). It installs per user
 //! (no administrator rights needed) into `%LOCALAPPDATA%\Programs\g4v`, creates
 //! Start Menu / desktop shortcuts, and registers in "Apps & features" so g4v can
 //! be uninstalled normally. The installed copy of this program is the uninstaller.
@@ -21,6 +22,87 @@ const VERSION: &str = env!("G4V_VERSION");
 const APP_EXE: &str = "g4v.exe";
 const UNINSTALL_EXE: &str = "uninstall.exe";
 const REG_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\g4v";
+/// The folder, inside the install directory, that holds the bundled Git.
+const GIT_DIR: &str = "git";
+/// Present in a bundled Git folder; nothing without it is ever deleted.
+const GIT_MARKER: &str = ".g4v-bundle";
+const TRAILER_MAGIC: &[u8; 8] = b"G4VGIT01";
+
+/// The Git bundle appended to this program: (bytes of the program without it, the zip).
+fn read_self() -> Result<(Vec<u8>, Option<std::ops::Range<usize>>), String> {
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&me).map_err(|e| format!("Could not read {}: {e}", me.display()))?;
+    let n = bytes.len();
+    if n >= 16 && &bytes[n - 8..] == TRAILER_MAGIC {
+        let len = u64::from_le_bytes(bytes[n - 16..n - 8].try_into().unwrap()) as usize;
+        if len <= n - 16 {
+            let start = n - 16 - len;
+            return Ok((bytes, Some(start..n - 16)));
+        }
+    }
+    Ok((bytes, None))
+}
+
+/// Extracts the bundled Git to `<dir>\git` by way of `git.new`, so a failure never leaves a half-written Git.
+fn install_git(dir: &Path, zip_bytes: &[u8]) -> Result<(), String> {
+    let new = dir.join("git.new");
+    if new.exists() {
+        std::fs::remove_dir_all(&new).map_err(|e| format!("Could not clear {}: {e}", new.display()))?;
+    }
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| format!("The bundled Git is damaged: {e}"))?;
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        // enclosed_name refuses absolute paths and `..`.
+        let Some(rel) = f.enclosed_name() else { return Err(format!("Unsafe path in the bundled Git: {}", f.name())) };
+        let out = new.join(rel);
+        if f.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut w = std::fs::File::create(&out).map_err(|e| format!("Could not write {}: {e}", out.display()))?;
+        std::io::copy(&mut f, &mut w).map_err(|e| format!("Could not write {}: {e}", out.display()))?;
+    }
+    if !new.join(GIT_MARKER).exists() || !new.join(r"cmd\git.exe").exists() {
+        return Err("The bundled Git is incomplete.".into());
+    }
+    let cur = dir.join(GIT_DIR);
+    let old = dir.join("git.old");
+    if old.exists() {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    if cur.exists() {
+        if !cur.join(GIT_MARKER).exists() {
+            return Err(format!("{} exists and isn't g4v's Git; move it away and try again.", cur.display()));
+        }
+        std::fs::rename(&cur, &old)
+            .map_err(|e| format!("Could not replace g4v's Git ({e}). Close g4v and any Git windows it opened, then try again."))?;
+    }
+    if let Err(e) = std::fs::rename(&new, &cur) {
+        if old.exists() {
+            let _ = std::fs::rename(&old, &cur);
+        }
+        return Err(format!("Could not install g4v's Git: {e}"));
+    }
+    // A file still in use only delays this to the next install.
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(())
+}
+
+fn dir_size(p: &Path) -> u64 {
+    std::fs::read_dir(p)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => dir_size(&e.path()),
+                    _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 struct Options {
@@ -92,9 +174,15 @@ fn install(o: &Options) -> Result<PathBuf, String> {
     std::fs::rename(&tmp, &app).map_err(|e| format!("Could not replace {}: {e}", app.display()))?;
 
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let (self_bytes, git_zip) = read_self()?;
+    if let Some(range) = &git_zip {
+        install_git(&o.dir, &self_bytes[range.clone()])?;
+    }
     let uninstaller = o.dir.join(UNINSTALL_EXE);
     if me != uninstaller {
-        std::fs::copy(&me, &uninstaller).map_err(|e| format!("Could not write the uninstaller: {e}"))?;
+        // The uninstaller doesn't need the Git bundle: copy this program without it.
+        let stub = git_zip.as_ref().map(|r| &self_bytes[..r.start]).unwrap_or(&self_bytes);
+        std::fs::write(&uninstaller, stub).map_err(|e| format!("Could not write the uninstaller: {e}"))?;
     }
 
     if o.start_menu {
@@ -108,7 +196,10 @@ fn install(o: &Options) -> Result<PathBuf, String> {
         }
     }
     if o.register {
-        let size_kb = (PAYLOAD.len() / 1024 + std::fs::metadata(&uninstaller).map(|m| m.len() as usize / 1024).unwrap_or(0)).to_string();
+        let size_kb = (PAYLOAD.len() / 1024
+            + std::fs::metadata(&uninstaller).map(|m| m.len() as usize / 1024).unwrap_or(0)
+            + (dir_size(&o.dir.join(GIT_DIR)) / 1024) as usize)
+            .to_string();
         let uninstall_cmd = format!("\"{}\" --uninstall", uninstaller.display());
         let quiet_cmd = format!("\"{}\" --uninstall --silent", uninstaller.display());
         let icon = app.display().to_string();
@@ -132,21 +223,32 @@ fn install(o: &Options) -> Result<PathBuf, String> {
     Ok(app)
 }
 
-/// Install directory recorded in the registry, else the folder this program runs from.
+/// The install to remove: the folder this uninstaller runs from when it is an install (holds g4v.exe), else the one
+/// recorded in the registry. Never the registry first: a second copy's uninstaller would remove the main install.
 fn installed_dir() -> PathBuf {
-    let out = hide(Command::new("reg").args(["query", REG_KEY, "/v", "InstallLocation"])).output();
-    if let Ok(o) = out {
-        let text = String::from_utf8_lossy(&o.stdout);
-        if let Some(line) = text.lines().find(|l| l.contains("InstallLocation")) {
-            if let Some(idx) = line.find("REG_SZ") {
-                let p = line[idx + 6..].trim();
-                if !p.is_empty() {
-                    return PathBuf::from(p);
-                }
-            }
+    if let Some(here) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        if here.join(APP_EXE).is_file() {
+            return here;
         }
     }
+    if let Some(p) = registered_dir() {
+        return p;
+    }
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(default_dir)
+}
+
+/// The install folder recorded in "Apps & features", if any.
+fn registered_dir() -> Option<PathBuf> {
+    let o = hide(Command::new("reg").args(["query", REG_KEY, "/v", "InstallLocation"])).output().ok()?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    let line = text.lines().find(|l| l.contains("InstallLocation"))?;
+    let p = line[line.find("REG_SZ")? + 6..].trim();
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    norm(a) == norm(b)
 }
 
 fn uninstall() -> Result<(), String> {
@@ -161,9 +263,19 @@ fn uninstall() -> Result<(), String> {
             let _ = std::fs::remove_file(lnk);
         }
     }
-    let _ = run("reg", &["delete", REG_KEY, "/f"]);
+    // Only this install's registration: another copy's uninstaller must not orphan the main install.
+    if registered_dir().is_some_and(|r| same_dir(&r, &dir)) {
+        let _ = run("reg", &["delete", REG_KEY, "/f"]);
+    }
     if app.exists() {
         std::fs::remove_file(&app).map_err(|e| format!("Could not remove {}: {e}", app.display()))?;
+    }
+    // g4v's own Git, only if it carries the marker the installer wrote.
+    for name in [GIT_DIR, "git.new", "git.old"] {
+        let g = dir.join(name);
+        if g.join(GIT_MARKER).exists() {
+            std::fs::remove_dir_all(&g).map_err(|e| format!("Could not remove {}: {e}", g.display()))?;
+        }
     }
     // Only g4v's own files are removed. User settings (%APPDATA%\g4v) and repositories are untouched.
     // This program may be the uninstaller inside `dir`, which can't delete itself while running:
@@ -200,6 +312,8 @@ struct SetupApp {
     opts: Options,
     dir_text: String,
     launch: bool,
+    /// Whether this setup program carries Git (read once: the file is large).
+    bundled_git: bool,
 }
 
 impl eframe::App for SetupApp {
@@ -220,7 +334,12 @@ impl eframe::App for SetupApp {
                     ui.checkbox(&mut self.opts.desktop, "Create a desktop shortcut");
                     ui.checkbox(&mut self.launch, "Start g4v when finished");
                     ui.add_space(6.0);
-                    ui.label(RichText::new("g4v needs Git (git-scm.com). Git LFS is recommended for art files.").small().weak());
+                    let note = if self.bundled_git {
+                        "Includes Git, Git LFS and Git Credential Manager — nothing else to install."
+                    } else {
+                        "g4v needs Git (git-scm.com). Git LFS is recommended for art files."
+                    };
+                    ui.label(RichText::new(note).small().weak());
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new(RichText::new("Install").strong()).min_size(egui::vec2(110.0, 30.0))).clicked() {
@@ -325,6 +444,7 @@ fn main() {
         dir_text: opts.dir.display().to_string(),
         opts,
         launch: true,
+        bundled_git: read_self().map(|(_, z)| z.is_some()).unwrap_or(false),
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

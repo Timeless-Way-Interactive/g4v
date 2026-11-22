@@ -24,6 +24,8 @@ pub struct Settings {
     /// Push right after committing (Perforce-style "Submit").
     pub push_on_submit: bool,
     pub ui_scale: f32,
+    /// Use the Git installed on this computer instead of the one that came with g4v (takes effect on restart).
+    pub use_system_git: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             backup_retention_days: 30,
             push_on_submit: true,
             ui_scale: 1.0,
+            use_system_git: false,
         }
     }
 }

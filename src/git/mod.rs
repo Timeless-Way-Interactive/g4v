@@ -20,6 +20,7 @@ pub mod lfs;
 pub mod ops;
 pub mod shelf;
 pub mod status;
+pub mod submodules;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -130,11 +131,101 @@ pub fn nul_join<S: AsRef<str>>(paths: &[S]) -> Vec<u8> {
     out
 }
 
-/// Locates the git executable once.
+/// Which Git g4v runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitSource {
+    /// `G4V_GIT` names the executable.
+    Env(OsString),
+    /// The Git the Windows installer put next to g4v (`<install dir>\git`, holding `cmd\git.exe`).
+    Bundled(PathBuf),
+    /// `git` from PATH.
+    System,
+}
+
+static GIT_SOURCE: std::sync::OnceLock<GitSource> = std::sync::OnceLock::new();
+
+/// The bundled Git next to the running g4v, if the installer put one there. It carries a marker file so a folder that
+/// merely happens to be called `git` is never used.
+pub fn bundled_git_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.join("git");
+    (dir.join(".g4v-bundle").is_file() && dir.join("cmd").join("git.exe").is_file()).then_some(dir)
+}
+
+fn system_git_works() -> bool {
+    let mut cmd = Command::new("git");
+    cmd.arg("--version");
+    hide_window(&mut cmd);
+    cmd.output().is_ok_and(|o| o.status.success())
+}
+
+/// The order: `G4V_GIT`, then the bundled Git (unless the user prefers the system one and it works), then PATH.
+pub fn choose_git_source(
+    env: Option<OsString>,
+    bundled: Option<PathBuf>,
+    prefer_system: bool,
+    system_works: impl FnOnce() -> bool,
+) -> GitSource {
+    if let Some(e) = env {
+        return GitSource::Env(e);
+    }
+    match bundled {
+        Some(b) if !(prefer_system && system_works()) => GitSource::Bundled(b),
+        _ => GitSource::System,
+    }
+}
+
+/// Decides which Git to use, once, before any git command runs (call it first thing in `main`). With the bundled Git,
+/// its `cmd` folder also goes first on this process's PATH, so everything g4v starts — git hooks, the project's
+/// post-sync scripts, the editor and its source control plugin — uses the same Git, Git LFS and credential helper.
+pub fn select_git(prefer_system: bool) -> &'static GitSource {
+    GIT_SOURCE.get_or_init(|| {
+        let source = choose_git_source(std::env::var_os("G4V_GIT"), bundled_git_dir(), prefer_system, system_git_works);
+        if let GitSource::Bundled(dir) = &source {
+            let cmd = dir.join("cmd");
+            let current = std::env::var_os("PATH").unwrap_or_default();
+            let rest = std::env::split_paths(&current).filter(|p| p != &cmd);
+            if let Ok(joined) = std::env::join_paths(std::iter::once(cmd.clone()).chain(rest)) {
+                // Runs before g4v starts any thread.
+                std::env::set_var("PATH", joined);
+            }
+        }
+        source
+    })
+}
+
+/// The Git in use (`select_git(false)` if nothing chose yet, as in tests).
+pub fn git_source() -> &'static GitSource {
+    select_git(false)
+}
+
+/// Locates the git executable.
 fn git_exe() -> &'static OsStr {
-    use std::sync::OnceLock;
-    static EXE: OnceLock<OsString> = OnceLock::new();
-    EXE.get_or_init(|| std::env::var_os("G4V_GIT").unwrap_or_else(|| OsString::from("git")))
+    static EXE: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| match git_source() {
+        GitSource::Env(e) => e.clone(),
+        GitSource::Bundled(dir) => dir.join("cmd").join("git.exe").into_os_string(),
+        GitSource::System => OsString::from("git"),
+    })
+}
+
+/// Runs git outside any repository (account commands and the like); stdout, trimmed, or stderr as the error.
+pub fn run_plain(args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new(git_exe());
+    cmd.args(args).stdin(Stdio::null());
+    hide_window(&mut cmd);
+    let o = cmd.output().map_err(|e| e.to_string())?;
+    if o.status.success() {
+        Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        Err(if err.is_empty() { format!("git {} failed", args.join(" ")) } else { err })
+    }
+}
+
+/// GitHub accounts Git Credential Manager has stored on this computer. `Err` when GCM isn't available.
+pub fn github_accounts() -> Result<Vec<String>, String> {
+    let out = run_plain(&["credential-manager", "github", "list"])?;
+    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
 }
 
 /// Returns `git --version`, or an error if git is not installed.
@@ -514,4 +605,23 @@ pub fn run_global(args: &[&OsStr], cwd: Option<&Path>, log: &CmdLog) -> GitResul
         });
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn git_source_order() {
+        let b = || Some(PathBuf::from("C:/g4v/git"));
+        // G4V_GIT always wins.
+        assert_eq!(choose_git_source(Some("x".into()), b(), false, || true), GitSource::Env("x".into()));
+        // The bundled Git by default, even when a system Git exists.
+        assert_eq!(choose_git_source(None, b(), false, || true), GitSource::Bundled(PathBuf::from("C:/g4v/git")));
+        // The system Git when preferred and working; the bundle when it isn't.
+        assert_eq!(choose_git_source(None, b(), true, || true), GitSource::System);
+        assert_eq!(choose_git_source(None, b(), true, || false), GitSource::Bundled(PathBuf::from("C:/g4v/git")));
+        // No bundle: PATH.
+        assert_eq!(choose_git_source(None, None, false, || false), GitSource::System);
+    }
 }

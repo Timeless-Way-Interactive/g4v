@@ -135,6 +135,30 @@ This produces `dist\g4v-setup-<version>.exe`, a single self-contained installer.
 *Settings › Apps* so it can be uninstalled normally. Unattended use: `g4v-setup.exe --silent [--dir PATH]` and
 `uninstall.exe --uninstall --silent`. Uninstalling never touches your repositories or g4v settings.
 
+**The installer includes Git.** Nobody needs to install Git, Git LFS or a credential manager first. `build.ps1`
+downloads MinGit (Git for Windows' build for applications, which includes Git Credential Manager) and Git LFS,
+refuses either unless its SHA-256 matches `installer\git-bundle.json`, and appends them to the setup program. They're
+installed to `<install dir>\git`, with their own system config: LFS filters, `credential.helper=manager`,
+`core.longpaths=true` and the Git for Windows defaults. The user's own `~/.gitconfig` still applies, and a Git
+installed separately is unaffected.
+
+g4v uses that Git unless `G4V_GIT` names another, or *Settings › Use the Git installed on this computer* is on (after
+a restart). It also puts it first on `PATH` for everything g4v starts: git hooks, a project's post-sync scripts and
+the editor. *File › GitHub account…* shows who is signed in and signs in or out through the bundled Credential
+Manager. Sign-ins are stored in Windows Credential Manager and shared with any other Git on the machine.
+
+To update the bundled Git:
+1. Change `version`, `url` and `sha256` together in `installer\git-bundle.json`. Each GitHub release lists the
+   SHA-256 of its assets.
+2. Run `build.ps1`. Its built-in checks confirm that the bundled `git`, `git lfs` and `git credential-manager`
+   start, and that the bundle's own config is the one in effect.
+3. Ship a new installer. Git security fixes reach users only this way, so watch the
+   [Git for Windows releases](https://github.com/git-for-windows/git/releases).
+
+Licenses: MinGit is GPL-2.0 (with the components listed in its `LICENSE.txt`), and Git LFS and Git Credential Manager
+are MIT. `git\THIRD-PARTY-NOTICES.txt` names each one's version and source. They are shipped unmodified and run as
+separate programs.
+
 ### macOS installer
 
 On a Mac with the Xcode Command Line Tools and rustup:

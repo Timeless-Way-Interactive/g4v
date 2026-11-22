@@ -23,6 +23,8 @@ fn extend_macos_path() {
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "macos")]
     extend_macos_path();
+    // Before anything runs git: the installer's own Git unless the user chose the one installed on the computer.
+    g4v::git::select_git(g4v::settings::Settings::load().use_system_git);
     // `g4v [folder ...]` opens the given repositories as tabs. (Older macOS passes `-psn_…` to apps opened from
     // Finder; that isn't a folder.)
     let open: Vec<PathBuf> = std::env::args_os().skip(1).filter(|a| !a.to_string_lossy().starts_with("-psn_")).map(PathBuf::from).collect();

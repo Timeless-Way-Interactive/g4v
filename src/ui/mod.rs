@@ -17,6 +17,9 @@ use std::sync::mpsc::Receiver;
 use tab::{AppRequest, RepoTab};
 use theme::{icon, ACCENT, MUTED, RED};
 
+/// The answer of a background account operation: the GitHub accounts afterwards.
+type AccountReply = Receiver<Result<Vec<String>, String>>;
+
 enum GlobalDialog {
     Clone {
         url: String,
@@ -33,6 +36,12 @@ enum GlobalDialog {
     },
     /// Holds the global git identity, looked up once when the dialog opens.
     Settings(crate::git::ops::Identity),
+    /// GitHub sign-in through Git Credential Manager. `pending` is a sign-in, sign-out or listing in progress; it
+    /// answers with the account list afterwards.
+    Account {
+        accounts: Option<Result<Vec<String>, String>>,
+        pending: Option<(String, AccountReply)>,
+    },
     About,
     Help,
     Error(String),
@@ -155,6 +164,10 @@ impl G4vApp {
                 if !self.tabs.is_empty() && ui.button("Close tab").clicked() {
                     ui.close();
                     self.close_tab(self.active);
+                }
+                if ui.button("GitHub account…").clicked() {
+                    ui.close();
+                    self.dialog = Some(account_dialog("Checking…", |_| Ok(())));
                 }
                 if ui.button("Settings…").clicked() {
                     ui.close();
@@ -463,6 +476,21 @@ impl G4vApp {
                         ui.end_row();
                     });
                     ui.separator();
+                    let bundled = crate::git::bundled_git_dir().is_some();
+                    let using = match crate::git::git_source() {
+                        crate::git::GitSource::Bundled(_) => "the Git that came with g4v",
+                        crate::git::GitSource::System => "the Git installed on this computer",
+                        crate::git::GitSource::Env(_) => "the Git named by G4V_GIT",
+                    };
+                    ui.label(theme::small(format!("Using {using}: {}", self.git.as_deref().unwrap_or("not found"))));
+                    if bundled
+                        && ui
+                            .checkbox(&mut self.settings.use_system_git, "Use the Git installed on this computer instead (restart g4v to apply)")
+                            .on_hover_text("For programmers who keep their own Git. Artists should leave this off.")
+                            .changed()
+                    {
+                        self.settings.save();
+                    }
                     ui.label(theme::small(format!(
                         "Git identity: {} <{}>",
                         global.name.as_deref().unwrap_or("not set"),
@@ -477,6 +505,64 @@ impl G4vApp {
                     });
                     if self.settings != before {
                         self.settings.save();
+                    }
+                }
+                GlobalDialog::Account { accounts, pending } => {
+                    ui.heading("GitHub account");
+                    if let Some((_, rx)) = pending {
+                        if let Ok(r) = rx.try_recv() {
+                            *accounts = Some(r);
+                            *pending = None;
+                        }
+                    }
+                    let mut next: Option<GlobalDialog> = None;
+                    match (&*pending, &*accounts) {
+                        (Some((what, _)), _) => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(what.as_str());
+                            });
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                        }
+                        (None, Some(Err(e))) => {
+                            ui.label(RichText::new("Git Credential Manager isn't available, so g4v can't manage sign-in.").color(RED));
+                            ui.label(theme::small(e.clone()));
+                        }
+                        (None, Some(Ok(list))) => {
+                            if list.is_empty() {
+                                ui.label("You're not signed in to GitHub on this computer.");
+                            } else {
+                                ui.label("Signed in on this computer as:");
+                                for a in list.clone() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&a).strong());
+                                        if ui.button("Sign out").clicked() {
+                                            next = Some(account_dialog("Signing out…", move |_| {
+                                                crate::git::run_plain(&["credential-manager", "github", "logout", &a]).map(|_| ())
+                                            }));
+                                        }
+                                    });
+                                }
+                            }
+                            ui.add_space(6.0);
+                            let label = if list.is_empty() { "Sign in to GitHub" } else { "Add another account" };
+                            if ui.button(RichText::new(label).strong()).clicked() {
+                                next = Some(account_dialog("Finish signing in in the window that opened…", |_| {
+                                    crate::git::run_plain(&["credential-manager", "github", "login"]).map(|_| ())
+                                }));
+                            }
+                            ui.label(theme::small(
+                                "Sign-in is stored in Windows Credential Manager and used for cloning, Get Latest, Submit, locks and build downloads.",
+                            ));
+                        }
+                        (None, None) => {}
+                    }
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                    if let Some(n) = next {
+                        *self.dialog.as_mut().unwrap() = n;
                     }
                 }
                 GlobalDialog::About => {
@@ -670,4 +756,14 @@ impl eframe::App for G4vApp {
             }
         }
     }
+}
+
+/// The account dialog with `action` running in the background (shown as `what`), then the account list.
+fn account_dialog(what: &str, action: impl FnOnce(()) -> Result<(), String> + Send + 'static) -> GlobalDialog {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = action(()).and_then(|_| crate::git::github_accounts());
+        let _ = tx.send(r);
+    });
+    GlobalDialog::Account { accounts: None, pending: Some((what.to_string(), rx)) }
 }
