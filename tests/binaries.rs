@@ -545,3 +545,108 @@ fn an_optional_submodule_without_access_never_blocks_clone_or_get_latest() {
     let r = Repo::open(&dest, CmdLog::default()).unwrap();
     r.update_submodules_if_any().unwrap();
 }
+
+/// Review finding: rollback's temporary file used a fixed name next to each binary and removed whatever was there.
+#[test]
+fn rollback_never_touches_a_users_file_next_to_a_binary() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    get_latest(&w, &r, &cfg).unwrap(); // k1
+                                       // The old fixed temporary name, and the first name the new code tries, both already taken by the user.
+    let sentinels = ["bin/app.exe.g4v-restore".to_string(), format!("bin/.app.exe.g4v-restore-{}-0", std::process::id())];
+    for s in &sentinels {
+        std::fs::write(r.abs(s), "user data").unwrap();
+    }
+    let n2 = w.publish("k2", &[("bin/app.exe", "app v2")]);
+    let note: g4v::binaries::notes::Note = serde_json::from_str(&n2).unwrap();
+    let work = r.meta_dir().join("binaries");
+    let (staging, backup) = (work.join("staging"), work.join("backup"));
+    let staged = install::prepare(&cfg, &note, &w.src(), &w.cache, &staging, &|_| {}).unwrap();
+    install::swap(r.root(), &cfg, &staged, &backup, &|_| {}).unwrap();
+    install::restore(r.root(), &cfg, Some(&staged.manifest), &staging, &backup).unwrap();
+    assert_eq!(read(&r, "bin/app.exe"), "app v1");
+    for s in &sentinels {
+        assert_eq!(read(&r, s), "user data", "{s} survived");
+    }
+    let stray: Vec<String> = std::fs::read_dir(r.abs("bin"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("g4v-restore") && !sentinels.iter().any(|s| s.ends_with(n.as_str())))
+        .collect();
+    assert!(stray.is_empty(), "no temporary files left: {stray:?}");
+}
+
+/// Review finding: with the executable and .binkey present but the manifest gone, Launch skipped every check.
+#[test]
+fn a_lost_install_record_still_counts_as_a_damaged_install() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    get_latest(&w, &r, &cfg).unwrap();
+    std::fs::remove_file(r.abs("bin/.binmanifest.json")).unwrap();
+    assert_eq!(sync::launch_check(&r, &cfg).unwrap_err().fix, sync::LaunchFix::Repair);
+    get_latest(&w, &r, &cfg).unwrap();
+    assert!(sync::launch_check(&r, &cfg).is_ok());
+    // The other record lost instead: the same.
+    std::fs::remove_file(r.abs("bin/.binkey")).unwrap();
+    assert_eq!(sync::launch_check(&r, &cfg).unwrap_err().fix, sync::LaunchFix::Repair);
+}
+
+/// Review finding: a changed setup command at the same engine pin must run again.
+#[test]
+fn a_changed_setup_command_runs_again_at_the_same_engine_pin() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(true);
+    get_latest(&w, &r, &cfg).unwrap();
+    assert!(sync::setup_current(&r, &cfg));
+    let mut changed = cfg.clone();
+    changed.post_sync.as_mut().unwrap().run.push("--extra".into());
+    assert!(!sync::setup_current(&r, &changed), "new arguments: setup is due again");
+    let mut watched = cfg.clone();
+    watched.post_sync.as_mut().unwrap().when_changed.push("src".into());
+    assert!(!sync::setup_current(&r, &watched), "new watched paths: setup is due again");
+    sync::run_setup(&r, &changed, &|_| {}).unwrap();
+    assert!(sync::setup_current(&r, &changed));
+}
+
+/// Review finding: Launch.bat's PowerShell installer and g4v must exclude each other. Both lock the same file the
+/// same way (an OS byte-range lock on `<git dir>\g4v\binaries.lock`).
+#[cfg(windows)]
+#[test]
+fn launch_bat_installer_and_g4v_share_one_lock() {
+    use std::io::BufRead;
+    let w = World::standard();
+    let r = w.clone("artist");
+    std::fs::create_dir_all(r.meta_dir()).unwrap();
+    let path = r.meta_dir().join("binaries.lock").display().to_string().replace('\'', "''");
+    let ps = |script: String| {
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    // PowerShell holds it: g4v sees it taken.
+    let mut child = ps(format!(
+        "$fs=[IO.File]::Open('{path}','OpenOrCreate','ReadWrite','ReadWrite'); $fs.Lock(0,[int64]::MaxValue); 'held'; Start-Sleep 3; $fs.Dispose()"
+    ));
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "held");
+    assert!(sync::locked_by_other(&r));
+    assert!(get_latest(&w, &r, &config(false)).unwrap_err().contains("already updating"));
+    child.wait().unwrap();
+    assert!(!sync::locked_by_other(&r));
+    // g4v holds it: PowerShell is refused.
+    let held = sync::lock_workspace(&r).unwrap();
+    let out = ps(format!(
+        "$fs=[IO.File]::Open('{path}','OpenOrCreate','ReadWrite','ReadWrite'); try {{ $fs.Lock(0,[int64]::MaxValue); 'FREE' }} catch {{ 'LOCKED' }} finally {{ $fs.Dispose() }}"
+    ))
+    .wait_with_output()
+    .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "LOCKED");
+    drop(held);
+}

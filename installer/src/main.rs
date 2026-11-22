@@ -43,12 +43,42 @@ fn read_self() -> Result<(Vec<u8>, Option<std::ops::Range<usize>>), String> {
     Ok((bytes, None))
 }
 
-/// Extracts the bundled Git to `<dir>\git` by way of `git.new`, so a failure never leaves a half-written Git.
-fn install_git(dir: &Path, zip_bytes: &[u8]) -> Result<(), String> {
-    let new = dir.join("git.new");
-    if new.exists() {
-        std::fs::remove_dir_all(&new).map_err(|e| format!("Could not clear {}: {e}", new.display()))?;
+/// A new, empty folder `<dir>\<stem>-<pid>-<n>`, created here and so certainly ours. Never an existing one: the
+/// install folder may be one the user chose, holding anything.
+fn create_unique_dir(dir: &Path, stem: &str) -> Result<PathBuf, String> {
+    for n in 0..10_000 {
+        let p = dir.join(format!("{stem}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&p) {
+            Ok(()) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not create a folder in {}: {e}", dir.display())),
+        }
     }
+    Err(format!("Could not create a working folder in {}", dir.display()))
+}
+
+/// A name `<dir>\<stem>-<pid>-<n>` that nothing uses yet (for a rename target, which must not exist).
+fn unused_name(dir: &Path, stem: &str) -> PathBuf {
+    (0..)
+        .map(|n| dir.join(format!("{stem}-{}-{n}", std::process::id())))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("an unused name")
+}
+
+/// Extracts the bundled Git into a folder this run creates, then swaps it in for `<dir>\git`, so a failure never
+/// leaves a half-written Git. Deletes nothing it can't prove is its own: its own new folders, and a `git` folder
+/// only after checking the marker the installer writes into it.
+fn install_git(dir: &Path, zip_bytes: &[u8]) -> Result<(), String> {
+    let new = create_unique_dir(dir, "git.new")?;
+    let res = extract_git(&new, zip_bytes).and_then(|()| swap_git(dir, &new));
+    if res.is_err() && new.exists() {
+        // Created by this run: safe to remove.
+        let _ = std::fs::remove_dir_all(&new);
+    }
+    res
+}
+
+fn extract_git(new: &Path, zip_bytes: &[u8]) -> Result<(), String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).map_err(|e| format!("The bundled Git is damaged: {e}"))?;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
@@ -68,27 +98,45 @@ fn install_git(dir: &Path, zip_bytes: &[u8]) -> Result<(), String> {
     if !new.join(GIT_MARKER).exists() || !new.join(r"cmd\git.exe").exists() {
         return Err("The bundled Git is incomplete.".into());
     }
+    Ok(())
+}
+
+fn swap_git(dir: &Path, new: &Path) -> Result<(), String> {
     let cur = dir.join(GIT_DIR);
-    let old = dir.join("git.old");
-    if old.exists() {
-        let _ = std::fs::remove_dir_all(&old);
-    }
-    if cur.exists() {
-        if !cur.join(GIT_MARKER).exists() {
-            return Err(format!("{} exists and isn't g4v's Git; move it away and try again.", cur.display()));
+    let mut old = None;
+    if std::fs::symlink_metadata(&cur).is_ok() {
+        if !cur.join(GIT_MARKER).is_file() {
+            return Err(format!("{} exists and isn't g4v's Git, so it was left alone. Move it away and try again.", cur.display()));
         }
-        std::fs::rename(&cur, &old)
+        let o = unused_name(dir, "git.old");
+        std::fs::rename(&cur, &o)
             .map_err(|e| format!("Could not replace g4v's Git ({e}). Close g4v and any Git windows it opened, then try again."))?;
+        old = Some(o);
     }
-    if let Err(e) = std::fs::rename(&new, &cur) {
-        if old.exists() {
-            let _ = std::fs::rename(&old, &cur);
+    if let Err(e) = std::fs::rename(new, &cur) {
+        if let Some(o) = &old {
+            let _ = std::fs::rename(o, &cur);
         }
         return Err(format!("Could not install g4v's Git: {e}"));
     }
-    // A file still in use only delays this to the next install.
-    let _ = std::fs::remove_dir_all(&old);
+    // The previous Git (it carried the marker). A file still in use only leaves it for the next install or uninstall.
+    if let Some(o) = old {
+        let _ = std::fs::remove_dir_all(o);
+    }
+    remove_old_gits(dir);
     Ok(())
+}
+
+/// Earlier runs' leftover `git.old-*` / `git.new-*` folders that carry the installer's marker (anything else is left).
+fn remove_old_gits(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let p = e.path();
+        if (name.starts_with("git.old-") || name.starts_with("git.new-")) && p.join(GIT_MARKER).is_file() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
 }
 
 fn dir_size(p: &Path) -> u64 {
@@ -271,12 +319,11 @@ fn uninstall() -> Result<(), String> {
         std::fs::remove_file(&app).map_err(|e| format!("Could not remove {}: {e}", app.display()))?;
     }
     // g4v's own Git, only if it carries the marker the installer wrote.
-    for name in [GIT_DIR, "git.new", "git.old"] {
-        let g = dir.join(name);
-        if g.join(GIT_MARKER).exists() {
-            std::fs::remove_dir_all(&g).map_err(|e| format!("Could not remove {}: {e}", g.display()))?;
-        }
+    let g = dir.join(GIT_DIR);
+    if g.join(GIT_MARKER).is_file() {
+        std::fs::remove_dir_all(&g).map_err(|e| format!("Could not remove {}: {e}", g.display()))?;
     }
+    remove_old_gits(&dir);
     // Only g4v's own files are removed. User settings (%APPDATA%\g4v) and repositories are untouched.
     // This program may be the uninstaller inside `dir`, which can't delete itself while running:
     // hand that off to a short-lived background command.
@@ -455,4 +502,55 @@ fn main() {
         ..Default::default()
     };
     let _ = eframe::run_native("g4v-setup", native, Box::new(|_| Ok(Box::new(app))));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let o = zip::write::SimpleFileOptions::default();
+        for (p, body) in [(GIT_MARKER, "{}"), ("cmd/git.exe", "exe")] {
+            z.start_file(p, o).unwrap();
+            z.write_all(body.as_bytes()).unwrap();
+        }
+        z.finish().unwrap();
+        buf.into_inner()
+    }
+
+    /// Review finding: folders the user happens to have next to the install are never deleted.
+    #[test]
+    fn installing_git_never_deletes_folders_it_does_not_own() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["git.new", "git.old", "git.new-1-0", "git.old-1-0"] {
+            std::fs::create_dir_all(d.path().join(name)).unwrap();
+            std::fs::write(d.path().join(name).join("mine.txt"), name).unwrap();
+        }
+        install_git(d.path(), &bundle()).unwrap();
+        install_git(d.path(), &bundle()).unwrap(); // upgrade over itself
+        for name in ["git.new", "git.old", "git.new-1-0", "git.old-1-0"] {
+            assert_eq!(std::fs::read_to_string(d.path().join(name).join("mine.txt")).unwrap(), name);
+        }
+        assert!(d.path().join("git").join(GIT_MARKER).is_file());
+        let leftovers: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("git.") && !["git.new", "git.old", "git.new-1-0", "git.old-1-0"].contains(&n.as_str()))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_git_folder_without_the_marker_is_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("git")).unwrap();
+        std::fs::write(d.path().join("git/mine.txt"), "x").unwrap();
+        assert!(install_git(d.path(), &bundle()).is_err());
+        assert_eq!(std::fs::read_to_string(d.path().join("git/mine.txt")).unwrap(), "x");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1, "nothing of this run is left behind");
+    }
 }

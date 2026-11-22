@@ -132,12 +132,19 @@ impl BinUi {
             let (r, cfg, state, running, ctx) =
                 (repo.clone(), cfg.clone(), self.launch_state.clone(), self.launch_running.clone(), ctx.clone());
             std::thread::spawn(move || {
+                // Cleared however this thread ends, a panic included, so the checks never stop for the session.
+                struct Done(Arc<AtomicBool>, egui::Context);
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                        self.1.request_repaint();
+                    }
+                }
+                let _done = Done(running, ctx);
                 let res = sync::launch_check(&r, &cfg);
                 if let Ok(mut s) = state.lock() {
                     *s = Some(res);
                 }
-                running.store(false, Ordering::Release);
-                ctx.request_repaint();
             });
         }
         if self.build_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {

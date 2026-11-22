@@ -189,21 +189,23 @@ fn setup_path(repo: &Repo) -> PathBuf {
     repo.meta_dir().join("binaries-setup.json")
 }
 
-/// What the post-sync command depends on at `rev`: the object IDs of its `when_changed` paths (for a submodule, its
-/// pinned commit), or the commit itself when it lists none.
+/// What the post-sync command depends on at `rev`: the command itself (program and arguments) and the paths it
+/// watches, then the object IDs of those paths (for a submodule, its pinned commit), or the commit itself when it
+/// watches none. A changed command, or a changed list of paths, is a different setup even at the same engine pin.
 fn setup_inputs(repo: &Repo, cfg: &BinariesConfig, rev: &str) -> Option<String> {
     let ps = cfg.post_sync.as_ref()?;
     let commit = repo.run(&["rev-parse", &format!("{rev}^{{commit}}")]).ok()?;
-    if ps.when_changed.is_empty() {
-        return Some(commit);
-    }
-    Some(
+    let ids = if ps.when_changed.is_empty() {
+        commit
+    } else {
         ps.when_changed
             .iter()
             .map(|p| repo.run(&["rev-parse", &format!("{commit}:{p}")]).unwrap_or_else(|_| "-".into()))
             .collect::<Vec<_>>()
-            .join(","),
-    )
+            .join(",")
+    };
+    let command = serde_json::json!({ "run": ps.run, "when_changed": ps.when_changed });
+    Some(format!("{command}|{ids}"))
 }
 
 fn recorded_setup(repo: &Repo) -> Option<String> {
@@ -715,18 +717,22 @@ pub fn launch_check(repo: &Repo, cfg: &BinariesConfig) -> Result<(), LaunchProbl
     if cfg.launch.is_empty() {
         return problem("this project doesn't say what to launch", LaunchFix::None);
     }
-    if pending_txn(repo).is_some() {
+    // Read once: a Get Latest finishing between two reads would otherwise make the second one come back empty.
+    if let Some(txn) = pending_txn(repo) {
         if locked_by_other(repo) {
             return problem(LOCKED, LaunchFix::None);
         }
-        return problem(describe_incomplete(&pending_txn(repo).unwrap()), LaunchFix::GetLatest);
+        return problem(describe_incomplete(&txn), LaunchFix::GetLatest);
     }
     match resolve_inside(repo.root(), &cfg.launch[0]) {
         Ok(p) if p.is_file() => {}
         Ok(_) => return problem("the editor isn't installed yet — Get Latest installs it", LaunchFix::GetLatest),
         Err(e) => return problem(e, LaunchFix::None),
     }
-    let managed = resolve_inside(repo.root(), &cfg.installed_manifest()).is_ok_and(|p| p.is_file());
+    // Managed: g4v (or Launch.bat) installed this editor, which either record shows. Losing one of the two doesn't
+    // turn a damaged install into "someone's own build" that skips every check below.
+    let record = |rel: &str| resolve_inside(repo.root(), rel).is_ok_and(|p| p.is_file());
+    let managed = record(&cfg.installed_manifest()) || record(&cfg.marker);
     if !managed || programmer_reason(repo, cfg).ok().flatten().is_some() {
         return Ok(());
     }

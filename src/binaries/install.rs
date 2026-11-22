@@ -336,19 +336,45 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 /// Puts `bak` at `dst` and keeps `bak`: a hard link where possible (same volume, instant), else a copy. Written
 /// under a temporary name first, so `dst` is either the old file or the restored one, never half of either.
+///
+/// The temporary file is always one this call creates (exclusively: a hard link or `create_new` fails rather than
+/// replace anything), under a fresh name, and only that file is ever removed. A file of the user's that happens to
+/// sit next to `dst` under any name is never touched.
 fn put_back(bak: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Some(p) = dst.parent() {
-        std::fs::create_dir_all(p)?;
+    let dir = dst.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let base = dst.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let mut created = None;
+    for n in 0..10_000u32 {
+        let tmp = dir.join(format!(".{base}.g4v-restore-{}-{n}", std::process::id()));
+        match std::fs::hard_link(bak, &tmp) {
+            Ok(()) => {
+                created = Some(tmp);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // No hard links here (another volume, a file system without them): copy into a file created new.
+            Err(_) => match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(mut f) => {
+                    let copied = std::fs::File::open(bak).and_then(|mut src| std::io::copy(&mut src, &mut f)).and_then(|_| f.sync_all());
+                    drop(f);
+                    if let Err(e) = copied {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(e);
+                    }
+                    created = Some(tmp);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            },
+        }
     }
-    let mut name = dst.file_name().unwrap_or_default().to_os_string();
-    name.push(".g4v-restore");
-    let tmp = dst.with_file_name(name);
-    let _ = std::fs::remove_file(&tmp);
-    if std::fs::hard_link(bak, &tmp).is_err() {
-        std::fs::copy(bak, &tmp)?;
-    }
+    let tmp = created.ok_or_else(|| std::io::Error::other(format!("no free temporary name next to {}", dst.display())))?;
     // rename replaces an existing file on Windows and Unix alike.
-    std::fs::rename(&tmp, dst)
+    std::fs::rename(&tmp, dst).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Undoes a (possibly partial or crashed) [`swap`] using only what is on disk: the new manifest, the staging
