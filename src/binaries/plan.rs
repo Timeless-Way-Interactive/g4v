@@ -63,6 +63,37 @@ pub fn ready(chain: &[CommitNote]) -> Vec<(usize, &CommitNote)> {
     chain.iter().enumerate().filter(|(_, c)| c.note.as_ref().is_some_and(Note::installable)).collect()
 }
 
+/// The builds Get Latest may try, newest first: the newest ready commit of each distinct key, at most `max` keys.
+/// Content-only commits share their key, so without this a run of them pointing at one pruned release would use up
+/// the whole fallback budget before an older build that still exists is ever tried.
+pub fn candidates(chain: &[CommitNote], max: usize) -> Vec<(usize, &CommitNote)> {
+    let mut seen = std::collections::HashSet::new();
+    ready(chain).into_iter().filter(|(_, c)| seen.insert(c.note.as_ref().map(|n| n.key.clone()))).take(max).collect()
+}
+
+/// What the newest commits above the installable target are doing, for the toolbar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Newer {
+    /// `count` newer commits, the newest of them building.
+    Building { count: usize },
+    /// The newest commit's build failed (or was given up on). Someone has to act.
+    Failed { commit: String, count: usize },
+    /// The newest commit has no build information yet: CI hasn't processed it (or never will).
+    NotIndexed { commit: String, count: usize },
+}
+
+/// The state of what's newer than `target` on the chain, if anything is.
+pub fn newer(chain: &[CommitNote], target: &str) -> Option<Newer> {
+    let above: Vec<&CommitNote> = chain.iter().take_while(|c| c.commit != target).collect();
+    let newest = above.first()?;
+    let count = above.len();
+    Some(match newest.note.as_ref().map(|n| n.state) {
+        Some(NoteState::Building) | Some(NoteState::Superseded) | Some(NoteState::Ready) => Newer::Building { count },
+        Some(NoteState::Failed) => Newer::Failed { commit: newest.commit.clone(), count },
+        None => Newer::NotIndexed { commit: newest.commit.clone(), count },
+    })
+}
+
 /// Is any commit on the chain building right now?
 pub fn building(chain: &[CommitNote]) -> usize {
     chain.iter().filter(|c| c.note.as_ref().is_some_and(|n| n.state == NoteState::Building)).count()
@@ -79,7 +110,7 @@ pub fn decide(facts: &Facts) -> Plan {
     if !facts.have_index {
         return Plan::Normal("the server has no build information yet".into());
     }
-    let ready = ready(&facts.chain);
+    let ready = candidates(&facts.chain, usize::MAX);
     let mut out = Vec::new();
     for (i, (_, c)) in ready.iter().enumerate() {
         let note = c.note.clone().expect("ready entries have notes");
@@ -189,6 +220,30 @@ mod tests {
         let mut f = base();
         f.have_index = false;
         assert!(matches!(decide(&f), Plan::Normal(_)));
+    }
+
+    #[test]
+    fn fallbacks_are_distinct_builds() {
+        let chain = vec![
+            c('e', note(NoteState::Ready, "k2")),
+            c('d', note(NoteState::Ready, "k2")),
+            c('c', note(NoteState::Ready, "k2")),
+            c('b', note(NoteState::Failed, "k3")),
+            c('a', note(NoteState::Ready, "k1")),
+        ];
+        let v: Vec<&str> = candidates(&chain, 8).iter().map(|(_, c)| c.note.as_ref().unwrap().key.as_str()).collect();
+        assert_eq!(v, ["k2", "k1"], "three commits sharing a pruned k2 don't hide k1");
+        assert_eq!(candidates(&chain, 1).len(), 1);
+    }
+
+    #[test]
+    fn newer_reports_the_newest_commits_real_state() {
+        let chain =
+            vec![c('c', note(NoteState::Failed, "k3")), c('b', note(NoteState::Building, "k2")), c('a', note(NoteState::Ready, "k1"))];
+        assert_eq!(newer(&chain, &id('a')), Some(Newer::Failed { commit: id('c'), count: 2 }));
+        assert_eq!(newer(&chain[1..], &id('a')), Some(Newer::Building { count: 1 }));
+        assert_eq!(newer(&[c('x', None), c('a', None)], &id('a')), Some(Newer::NotIndexed { commit: id('x'), count: 1 }));
+        assert_eq!(newer(&chain, &id('c')), None);
     }
 
     #[test]

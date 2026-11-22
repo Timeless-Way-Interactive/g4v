@@ -31,6 +31,12 @@ pub type Progress<'a> = &'a dyn Fn(u64, Option<u64>);
 pub trait AssetSource: Send + Sync {
     /// Downloads `asset` of `release` to `dest` (replacing it). May resume a `<dest>.partial` left by an earlier try.
     fn fetch(&self, release: &str, asset: &str, dest: &Path, progress: Progress) -> Result<(), FetchError>;
+
+    /// Can this user see the releases at all? Asked before a missing release is taken to mean "never built": for a
+    /// private repository, a user who isn't signed in (or has no access) gets the same 404 as for a pruned build.
+    fn check_access(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Picks the source for `repo` / `release_repo`.
@@ -114,6 +120,28 @@ impl GitHubSource {
 }
 
 impl AssetSource for GitHubSource {
+    fn check_access(&self) -> Result<(), String> {
+        let agent = Self::agent();
+        let url = format!("{}/repos/{}", self.api, self.repo);
+        match self.request(&agent, &url, "application/vnd.github+json").call() {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(401 | 403 | 404, _)) if self.token.is_none() => Err(format!(
+                "You're not signed in to GitHub, so g4v can't see {}'s builds. Sign in with File › GitHub account…, then Get Latest again.",
+                self.repo
+            )),
+            Err(ureq::Error::Status(401, _)) => Err(
+                "GitHub didn't accept your saved sign-in (it may have expired). Sign in again with File › GitHub account…, then Get Latest again."
+                    .into(),
+            ),
+            Err(ureq::Error::Status(403 | 404, _)) => Err(format!(
+                "Your GitHub account can't see {}, where this project's builds are published. Ask the project's owner to give your account access, then Get Latest again.",
+                self.repo
+            )),
+            // Offline or GitHub unreachable: the download itself will say so.
+            Err(_) => Ok(()),
+        }
+    }
+
     fn fetch(&self, release: &str, asset: &str, dest: &Path, progress: Progress) -> Result<(), FetchError> {
         let agent = Self::agent();
         let id = self.asset_id(&agent, release, asset)?;

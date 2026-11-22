@@ -9,10 +9,17 @@
 //! Any failure in 4–6 puts the branch, the submodules, the files and the marker back together. The one state that
 //! can't always be undone offline is the post-sync command (engine dependencies, typically): if it fails both
 //! forwards and back, the log stays in `DepsIncomplete` and Launch is refused until a retry succeeds.
+//!
+//! The post-sync command's success is recorded against what it depends on (`.git/g4v/binaries-setup.json`: the
+//! object IDs of `when_changed` at the commit it ran for). It runs whenever that record doesn't match `HEAD` — on a
+//! first install too, where nothing "changed" — and Launch is refused until it has.
+//!
+//! Everything that changes the workspace holds an exclusive lock (`.git/g4v/binaries.lock`) from recovery to
+//! cleanup, so a second g4v window can't roll back an install the first one is still making.
 
 use super::config::BinariesConfig;
 use super::install::{self, Manifest, PrepareError, Report, Staged};
-use super::notes;
+use super::notes::{self, NoteState};
 use super::paths::resolve_inside;
 use super::plan::{self, Candidate, Facts, Movement, Plan};
 use super::source::AssetSource;
@@ -62,6 +69,8 @@ pub struct BinStatus {
     pub target: Option<String>,
     /// Newer commits than the target that don't have a build yet.
     pub waiting: usize,
+    /// What those newer commits are doing (the newest one's state decides).
+    pub newer: Option<plan::Newer>,
     pub building: usize,
     /// Key of the complete installed build.
     pub installed: Option<String>,
@@ -134,6 +143,111 @@ fn clear_txn(repo: &Repo) {
     let _ = std::fs::remove_dir_all(backup_dir(repo));
 }
 
+// ------------------------------------------------------------------ workspace lock
+
+/// Held while a Get Latest, rollback or setup changes this workspace. Released when dropped (and by the OS if g4v
+/// dies), so it can never be left behind.
+pub struct WorkspaceLock {
+    _file: std::fs::File,
+}
+
+fn lock_path(repo: &Repo) -> PathBuf {
+    repo.meta_dir().join("binaries.lock")
+}
+
+const LOCKED: &str = "g4v is already updating this project (in another window or tab). Wait for that to finish, then try again.";
+
+/// Takes the workspace lock, or says another g4v is holding it.
+pub fn lock_workspace(repo: &Repo) -> Result<WorkspaceLock, String> {
+    std::fs::create_dir_all(repo.meta_dir()).map_err(|e| e.to_string())?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(repo))
+        .map_err(|e| format!("{}: {e}", lock_path(repo).display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(WorkspaceLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LOCKED.into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("Could not lock the workspace: {e}")),
+    }
+}
+
+/// Is another process (or another tab) updating this workspace right now?
+pub fn locked_by_other(repo: &Repo) -> bool {
+    matches!(lock_workspace(repo), Err(e) if e == LOCKED)
+}
+
+// ------------------------------------------------------------------ setup record
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SetupRecord {
+    inputs: String,
+}
+
+fn setup_path(repo: &Repo) -> PathBuf {
+    repo.meta_dir().join("binaries-setup.json")
+}
+
+/// What the post-sync command depends on at `rev`: the object IDs of its `when_changed` paths (for a submodule, its
+/// pinned commit), or the commit itself when it lists none.
+fn setup_inputs(repo: &Repo, cfg: &BinariesConfig, rev: &str) -> Option<String> {
+    let ps = cfg.post_sync.as_ref()?;
+    let commit = repo.run(&["rev-parse", &format!("{rev}^{{commit}}")]).ok()?;
+    if ps.when_changed.is_empty() {
+        return Some(commit);
+    }
+    Some(
+        ps.when_changed
+            .iter()
+            .map(|p| repo.run(&["rev-parse", &format!("{commit}:{p}")]).unwrap_or_else(|_| "-".into()))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn recorded_setup(repo: &Repo) -> Option<String> {
+    std::fs::read(setup_path(repo)).ok().and_then(|b| serde_json::from_slice::<SetupRecord>(&b).ok()).map(|r| r.inputs)
+}
+
+fn record_setup(repo: &Repo, cfg: &BinariesConfig, rev: &str) -> Result<(), String> {
+    match setup_inputs(repo, cfg, rev) {
+        Some(inputs) => install::write_atomic(&setup_path(repo), &serde_json::to_vec(&SetupRecord { inputs }).map_err(|e| e.to_string())?),
+        None => Ok(()),
+    }
+}
+
+fn forget_setup(repo: &Repo) {
+    let _ = std::fs::remove_file(setup_path(repo));
+}
+
+/// Does `rev` need the post-sync command run (it never succeeded for what `rev` depends on)?
+fn setup_needed(repo: &Repo, cfg: &BinariesConfig, rev: &str) -> bool {
+    cfg.post_sync.is_some() && setup_inputs(repo, cfg, rev) != recorded_setup(repo)
+}
+
+/// Is the post-sync command done for the checked-out commit? (Always, when the project has none.)
+pub fn setup_current(repo: &Repo, cfg: &BinariesConfig) -> bool {
+    !setup_needed(repo, cfg, "HEAD")
+}
+
+/// Runs the post-sync command for `rev` and records its success. The record is dropped first: a run that fails
+/// halfway may have left the old setup half-replaced, so nothing may trust it until a run succeeds.
+fn run_setup_for(repo: &Repo, cfg: &BinariesConfig, rev: &str, report: Report) -> Result<(), String> {
+    forget_setup(repo);
+    run_post_sync(repo, cfg, report)?;
+    record_setup(repo, cfg, rev)
+}
+
+/// "Run setup": the post-sync command for the checked-out commit, on its own.
+pub fn run_setup(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<(), String> {
+    let _lock = lock_workspace(repo)?;
+    if pending_txn(repo).is_some() {
+        return Err("The last Get Latest didn't finish; Get Latest first.".into());
+    }
+    run_setup_for(repo, cfg, "HEAD", report)
+}
+
 pub fn describe_incomplete(t: &Txn) -> String {
     match t.phase {
         Phase::DepsIncomplete => {
@@ -165,6 +279,7 @@ pub fn status(repo: &Repo, cfg: &BinariesConfig) -> BinStatus {
     s.building = plan::building(&chain);
     if let Some((_, c)) = plan::ready(&chain).first() {
         s.waiting = plan::waiting_above(&chain, &c.commit);
+        s.newer = plan::newer(&chain, &c.commit);
         let head = repo.run(&["rev-parse", "HEAD"]).unwrap_or_default();
         s.up_to_date = head == c.commit && s.installed.as_deref() == c.note.as_ref().map(|n| n.key.as_str());
         s.target = Some(c.commit.clone());
@@ -220,11 +335,9 @@ fn record_submodules(repo: &Repo) -> Result<Vec<SubState>, String> {
     Ok(v)
 }
 
+/// The shared routine, so optional (private) submodules are never initialized for someone without access.
 fn update_submodules(repo: &Repo) -> Result<(), String> {
-    if has_submodules(repo) {
-        repo.git().args(["submodule", "update", "--init", "--recursive"]).run().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    repo.update_submodules_if_any().map_err(|e| e.to_string())
 }
 
 /// Puts submodules back on the branches they were on, where that branch's tip is what's now checked out.
@@ -360,22 +473,6 @@ fn run_post_sync(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<()
     Ok(())
 }
 
-fn post_sync_needed(repo: &Repo, cfg: &BinariesConfig, from: &str, to: &str) -> bool {
-    let Some(ps) = &cfg.post_sync else { return false };
-    if from == to {
-        return false;
-    }
-    if ps.when_changed.is_empty() {
-        return true;
-    }
-    let mut cmd = repo.git().args(["diff", "--quiet", from, to, "--"]);
-    for p in &ps.when_changed {
-        cmd = cmd.arg(p);
-    }
-    // Exit 1 = differences.
-    matches!(cmd.ok_codes(&[0]).quiet().run(), Err(e) if e.code == Some(1))
-}
-
 // ------------------------------------------------------------------ rollback
 
 /// Undoes an unfinished transaction: files, then branch and submodules, then (if it ran) the post-sync step.
@@ -394,8 +491,8 @@ pub fn rollback(repo: &Repo, cfg: &BinariesConfig, txn: &Txn, report: Report) ->
         update_submodules(repo)?;
         reattach(repo, &txn.submodules);
     }
-    if txn.deps_ran || txn.phase == Phase::DepsIncomplete {
-        if let Err(e) = run_post_sync(repo, cfg, report) {
+    if txn.deps_ran || txn.phase == Phase::DepsIncomplete || setup_needed(repo, cfg, "HEAD") {
+        if let Err(e) = run_setup_for(repo, cfg, "HEAD", report) {
             let mut t = txn.clone();
             t.phase = Phase::DepsIncomplete;
             save_txn(repo, &t)?;
@@ -408,6 +505,11 @@ pub fn rollback(repo: &Repo, cfg: &BinariesConfig, txn: &Txn, report: Report) ->
 
 /// Rolls back anything a crash or failure left behind. `Ok(true)` if there was something to undo.
 pub fn recover(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<bool, String> {
+    let _lock = lock_workspace(repo)?;
+    recover_locked(repo, cfg, report)
+}
+
+fn recover_locked(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<bool, String> {
     match pending_txn(repo) {
         Some(t) => rollback(repo, cfg, &t, report).map(|_| true),
         None => Ok(false),
@@ -425,7 +527,9 @@ pub fn get_latest(
     dirty: &[String],
     report: Report,
 ) -> Result<BinSyncOutcome, String> {
-    recover(repo, cfg, report)?;
+    // Held to the end: no other g4v may recover, stage or swap in this workspace meanwhile.
+    let _lock = lock_workspace(repo)?;
+    recover_locked(repo, cfg, report)?;
 
     report("Checking the server…".into());
     let remote = repo.fetch().map_err(|e| e.to_string())?;
@@ -453,8 +557,7 @@ pub fn get_latest(
     } else {
         Vec::new()
     };
-    let ready = plan::ready(&chain);
-    let ready = &ready[..ready.len().min(MAX_CANDIDATES)];
+    let ready = plan::candidates(&chain, MAX_CANDIDATES);
     let facts = Facts {
         head: head.clone(),
         ahead: st.branch.ahead,
@@ -467,12 +570,22 @@ pub fn get_latest(
     };
     let candidates = match plan::decide(&facts) {
         Plan::Normal(reason) => return normal(reason),
-        Plan::UpToDate => return Ok(BinSyncOutcome::UpToDate { waiting: plan::waiting_above(&chain, &head) }),
+        Plan::UpToDate => {
+            // Up to date can still mean setup never ran here (a fresh clone at the ready commit) or a run failed.
+            if setup_needed(repo, cfg, "HEAD") {
+                run_setup_for(repo, cfg, "HEAD", report)?;
+            }
+            return Ok(BinSyncOutcome::UpToDate { waiting: plan::waiting_above(&chain, &head) });
+        }
         Plan::NoBuild => return Ok(BinSyncOutcome::NoBuild { building: plan::building(&chain) }),
         Plan::Go(c) => c,
     };
 
-    // Download and verify before touching anything. A pruned or unfinished release falls back to an older build.
+    // Download and verify before touching anything. A pruned or unfinished release falls back to an older build —
+    // but only once it's clear the user can see the releases at all, or a missing sign-in looks like a missing build.
+    if candidates.iter().any(|c| facts.installed_key.as_deref() != Some(c.note.key.as_str())) {
+        src.check_access()?;
+    }
     let mut chosen: Option<(Candidate, Option<Staged>)> = None;
     for cand in candidates {
         if facts.installed_key.as_deref() == Some(cand.note.key.as_str()) {
@@ -536,11 +649,11 @@ pub fn get_latest(
             update_submodules(repo)?;
             reattach(repo, &txn.submodules);
         }
-        if post_sync_needed(repo, cfg, &head, &cand.commit) {
+        if setup_needed(repo, cfg, &cand.commit) {
             txn.phase = Phase::Deps;
             txn.deps_ran = true;
             save_txn(repo, &txn)?;
-            run_post_sync(repo, cfg, report)?;
+            run_setup_for(repo, cfg, &cand.commit, report)?;
         }
         if let Some(staged) = &staged {
             std::fs::write(new_manifest_path(repo), &staged.manifest_bytes).map_err(|e| e.to_string())?;
@@ -572,19 +685,72 @@ pub fn get_latest(
 
 // ------------------------------------------------------------------ launch
 
-/// Why Launch is unavailable right now, if it is.
-pub fn launch_blocker(repo: &Repo, cfg: &BinariesConfig) -> Option<String> {
+/// What fixes a [`LaunchProblem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchFix {
+    /// Get Latest (re)installs the build for this version ("Repair editor" when the install is damaged).
+    GetLatest,
+    Repair,
+    /// Run the project's setup step for this version.
+    RunSetup,
+    /// Wait, or nothing g4v can do.
+    None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchProblem {
+    pub message: String,
+    pub fix: LaunchFix,
+}
+
+fn problem(message: impl Into<String>, fix: LaunchFix) -> Result<(), LaunchProblem> {
+    Err(LaunchProblem { message: message.into(), fix })
+}
+
+/// Everything Launch needs to be true, checked off the UI thread (it reads every installed file's size):
+/// no unfinished Get Latest, the program present, and — for an editor g4v installed — every file of the build
+/// whole, the build the one this version of the project needs, and the setup step done for this version. A
+/// programmer's own build (local source edits, or no g4v install) is theirs: only its presence is checked.
+pub fn launch_check(repo: &Repo, cfg: &BinariesConfig) -> Result<(), LaunchProblem> {
     if cfg.launch.is_empty() {
-        return Some("this project doesn't say what to launch".into());
+        return problem("this project doesn't say what to launch", LaunchFix::None);
     }
-    if let Some(t) = pending_txn(repo) {
-        return Some(describe_incomplete(&t));
+    if pending_txn(repo).is_some() {
+        if locked_by_other(repo) {
+            return problem(LOCKED, LaunchFix::None);
+        }
+        return problem(describe_incomplete(&pending_txn(repo).unwrap()), LaunchFix::GetLatest);
     }
     match resolve_inside(repo.root(), &cfg.launch[0]) {
-        Ok(p) if p.is_file() => None,
-        Ok(_) => Some("the editor isn't installed yet — Get Latest installs it".into()),
-        Err(e) => Some(e),
+        Ok(p) if p.is_file() => {}
+        Ok(_) => return problem("the editor isn't installed yet — Get Latest installs it", LaunchFix::GetLatest),
+        Err(e) => return problem(e, LaunchFix::None),
     }
+    let managed = resolve_inside(repo.root(), &cfg.installed_manifest()).is_ok_and(|p| p.is_file());
+    if !managed || programmer_reason(repo, cfg).ok().flatten().is_some() {
+        return Ok(());
+    }
+    let Some(installed) = install::installed(repo.root(), cfg) else {
+        return problem("the installed editor is incomplete or damaged (files are missing or changed)", LaunchFix::Repair);
+    };
+    if let Some(note) = notes::note_for(repo, &cfg.notes_ref, "HEAD") {
+        if note.key != installed.key {
+            let why = match note.state {
+                NoteState::Ready => "the installed editor was built for a different version of the project",
+                _ => "this version of the project has no editor build yet",
+            };
+            return problem(format!("{why} — Get Latest fixes it"), LaunchFix::GetLatest);
+        }
+    }
+    if !setup_current(repo, cfg) {
+        return problem("this version's setup step (engine dependencies) hasn't finished", LaunchFix::RunSetup);
+    }
+    Ok(())
+}
+
+/// Why Launch is unavailable right now, if it is.
+pub fn launch_blocker(repo: &Repo, cfg: &BinariesConfig) -> Option<String> {
+    launch_check(repo, cfg).err().map(|p| p.message)
 }
 
 pub fn launch(repo: &Repo, cfg: &BinariesConfig) -> Result<(), String> {

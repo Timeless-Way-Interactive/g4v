@@ -323,9 +323,13 @@ fn post_sync_runs_when_its_paths_change_and_a_failure_blocks_launch() {
     let r = w.clone("artist");
     let cfg = config(true);
     git(r.root(), &["reset", "--hard", &w.c[0]]);
-    // c1 -> c2 doesn't change deps/: no post-sync.
+    // A first install runs setup even though nothing "changed": it has never run in this workspace.
     get_latest(&w, &r, &cfg).unwrap();
-    assert!(!r.abs("ran.txt").exists());
+    assert_eq!(read(&r, "ran.txt").lines().count(), 1);
+    assert!(sync::setup_current(&r, &cfg));
+    // Up to date, same deps/: not again.
+    get_latest(&w, &r, &cfg).unwrap();
+    assert_eq!(read(&r, "ran.txt").lines().count(), 1);
 
     // c2 -> c3 changes deps/, and the post-sync step fails both forwards and back.
     let n2 = w.publish("k2", &[("bin/app.exe", "app v2")]);
@@ -408,4 +412,136 @@ fn github_source_downloads_a_public_release_asset() {
     assert!(text.contains("ripgrep-14.1.0-x86_64-pc-windows-msvc.zip"), "{text}");
     assert!(matches!(src.fetch("14.1.0", "no-such-asset", &dest, &|_, _| {}), Err(FetchError::NotFound)));
     assert!(matches!(src.fetch("no-such-tag-g4v", "x", &dest, &|_, _| {}), Err(FetchError::NotFound)));
+}
+
+/// Review finding: a rollback that is itself interrupted must be safe to run again. The first attempt used to move
+/// the backups back (consuming them); a retry then saw neither a backup nor a staged copy and deleted the editor
+/// the first attempt had just restored.
+#[test]
+fn an_interrupted_rollback_can_run_again_without_deleting_the_restored_build() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    get_latest(&w, &r, &cfg).unwrap(); // k1 installed at c2
+    let n2 = w.publish("k2", &[("bin/app.exe", "app v2"), ("bin/lib.dll", "lib v2"), ("bin/new.dll", "new")]);
+    let note: g4v::binaries::notes::Note = serde_json::from_str(&n2).unwrap();
+    let work = r.meta_dir().join("binaries");
+    let (staging, backup) = (work.join("staging"), work.join("backup"));
+    let staged = install::prepare(&cfg, &note, &w.src(), &w.cache, &staging, &|_| {}).unwrap();
+    install::swap(r.root(), &cfg, &staged, &backup, &|_| {}).unwrap();
+    assert_eq!(read(&r, "bin/app.exe"), "app v2");
+
+    // Attempt 1 restores the files, then "crashes" before the transaction is cleared. Attempt 2 runs it again.
+    for attempt in 1..=2 {
+        install::restore(r.root(), &cfg, Some(&staged.manifest), &staging, &backup).unwrap();
+        assert_eq!(read(&r, "bin/app.exe"), "app v1", "attempt {attempt}");
+        assert_eq!(read(&r, "bin/lib.dll"), "lib v1", "attempt {attempt}");
+        assert!(!r.abs("bin/new.dll").exists(), "attempt {attempt}: a file only the new build had is gone");
+        assert!(install::installed(r.root(), &cfg).is_some_and(|m| m.key == "k1"), "attempt {attempt}");
+    }
+    assert!(backup.exists(), "the backup stays until the whole rollback commits");
+}
+
+/// Review finding: Launch stayed enabled with a required DLL missing.
+#[test]
+fn a_damaged_install_blocks_launch_and_get_latest_repairs_it() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    get_latest(&w, &r, &cfg).unwrap();
+    assert!(sync::launch_check(&r, &cfg).is_ok());
+    std::fs::remove_file(r.abs("bin/lib.dll")).unwrap();
+    let p = sync::launch_check(&r, &cfg).unwrap_err();
+    assert_eq!(p.fix, sync::LaunchFix::Repair, "{}", p.message);
+    get_latest(&w, &r, &cfg).unwrap();
+    assert_eq!(read(&r, "bin/lib.dll"), "lib v1");
+    assert!(sync::launch_check(&r, &cfg).is_ok());
+}
+
+/// Launch is refused when the installed build isn't the one the checked-out version needs.
+#[test]
+fn launch_refuses_an_editor_built_for_another_version() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    get_latest(&w, &r, &cfg).unwrap(); // k1 at c2
+    let n2 = w.publish("k2", &[("bin/app.exe", "app v2")]);
+    w.note(&w.c[2], &n2);
+    r.fetch().unwrap();
+    g4v::binaries::notes::fetch(&r, "origin", "refs/notes/binaries").unwrap();
+    // A plain git pull to c3 leaves k1 installed.
+    git(r.root(), &["merge", "--ff-only", &w.c[2]]);
+    let p = sync::launch_check(&r, &cfg).unwrap_err();
+    assert_eq!(p.fix, sync::LaunchFix::GetLatest, "{}", p.message);
+}
+
+/// Review finding: setup that never succeeded for this version blocks Launch until Run setup works.
+#[test]
+fn launch_waits_for_setup_and_run_setup_finishes_it() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(true);
+    std::fs::write(r.abs("fail.flag"), "").unwrap();
+    assert!(get_latest(&w, &r, &cfg).is_err());
+    std::fs::remove_file(r.abs("fail.flag")).unwrap();
+    // The failed Get Latest rolled back; a successful one leaves setup done.
+    get_latest(&w, &r, &cfg).unwrap();
+    assert!(sync::launch_check(&r, &cfg).is_ok());
+    // Something deletes the record (or a run failed later): Launch says so and Run setup fixes it.
+    std::fs::remove_file(r.meta_dir().join("binaries-setup.json")).unwrap();
+    assert_eq!(sync::launch_check(&r, &cfg).unwrap_err().fix, sync::LaunchFix::RunSetup);
+    sync::run_setup(&r, &cfg, &|_| {}).unwrap();
+    assert!(sync::launch_check(&r, &cfg).is_ok());
+}
+
+/// Review finding: a second g4v must not recover or install while the first is mid-install.
+#[test]
+fn a_second_instance_waits_for_the_workspace_lock() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    let held = sync::lock_workspace(&r).unwrap();
+    let err = get_latest(&w, &r, &cfg).unwrap_err();
+    assert!(err.contains("already updating"), "{err}");
+    assert!(sync::recover(&r, &cfg, &|_| {}).is_err());
+    assert!(sync::run_setup(&r, &cfg, &|_| {}).is_err());
+    assert!(sync::locked_by_other(&r));
+    drop(held);
+    assert!(!sync::locked_by_other(&r));
+    get_latest(&w, &r, &cfg).unwrap();
+}
+
+/// Review finding: a private submodule (no access) must not block clone or Get Latest for everyone else.
+#[test]
+fn an_optional_submodule_without_access_never_blocks_clone_or_get_latest() {
+    let w = World::standard();
+    let mk = |name: &str| {
+        let server = w.tmp.path().join(format!("{name}.git"));
+        git(w.tmp.path(), &["init", "--bare", "-b", "main", server.to_str().unwrap()]);
+        let seed = w.tmp.path().join(format!("{name}-seed"));
+        git(w.tmp.path(), &["clone", server.to_str().unwrap(), seed.to_str().unwrap()]);
+        std::fs::write(seed.join("f.txt"), name).unwrap();
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-m", name]);
+        git(&seed, &["push", "-u", "origin", "main"]);
+        server
+    };
+    let public = mk("public");
+    let private = mk("private");
+    git(&w.seed, &["submodule", "add", public.to_str().unwrap(), "Public"]);
+    git(&w.seed, &["submodule", "add", private.to_str().unwrap(), "Private"]);
+    std::fs::create_dir_all(w.seed.join(".g4v")).unwrap();
+    std::fs::write(w.seed.join(".g4v/submodules.toml"), "optional = [\"Private\"]\n").unwrap();
+    git(&w.seed, &["add", "-A"]);
+    git(&w.seed, &["commit", "-m", "submodules"]);
+    git(&w.seed, &["push"]);
+    // This teammate can't reach the private repository.
+    std::fs::rename(&private, w.tmp.path().join("private-moved.git")).unwrap();
+
+    let dest = w.tmp.path().join("teammate");
+    g4v::git::ops::clone(w.tmp.path().join("server.git").to_str().unwrap(), &dest, &CmdLog::default()).unwrap();
+    assert_eq!(std::fs::read_to_string(dest.join("Public/f.txt")).unwrap(), "public");
+    assert!(!dest.join("Private/f.txt").exists());
+    let r = Repo::open(&dest, CmdLog::default()).unwrap();
+    r.update_submodules_if_any().unwrap();
 }

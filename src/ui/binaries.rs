@@ -9,17 +9,24 @@ use super::tab::{Action, Dialog, Msg, OpOk, RepoTab};
 use super::theme::{self, icon, ACCENT, GREEN, MUTED, RED, YELLOW};
 use crate::binaries::builder::{self, BuildProgress};
 use crate::binaries::config::{BinariesConfig, LoadedConfig};
-use crate::binaries::sync::{self, BinStatus, BinSyncOutcome};
+use crate::binaries::plan::Newer;
+use crate::binaries::sync::{self, BinStatus, BinSyncOutcome, LaunchFix, LaunchProblem};
 use crate::binaries::trust::{Decision, TrustState, TrustStore};
 use crate::binaries::{install, source};
+use crate::git::ops::PullMode;
+use crate::git::Repo;
 use crate::settings::Settings;
 use eframe::egui::{self, Color32, RichText, Ui};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The worker job name of a binaries Get Latest.
-const SYNC_JOB: &str = "Getting latest";
+pub(super) const SYNC_JOB: &str = "Getting latest";
+const SETUP_JOB: &str = "Running setup";
+/// How often Launch's readiness is re-checked in the background (a deleted DLL shows up within this).
+const LAUNCH_RECHECK: Duration = Duration::from_secs(5);
 const LAUNCH_ICON: &str = ".g4v/launch-icon.png";
 const BUILD_BANNER: &str = ".g4v/build-banner.png";
 /// Larger images are ignored rather than uploaded as textures.
@@ -50,6 +57,10 @@ pub struct BinUi {
     /// The open trust prompt came from Get Latest, so answering it carries on with that Get Latest. From the set-up
     /// banner it doesn't: allowing only turns the features on.
     pub get_latest_after_trust: bool,
+    /// Launch's readiness ([`sync::launch_check`]), worked out on a background thread; `None` until the first check.
+    launch_state: Arc<Mutex<Option<Result<(), LaunchProblem>>>>,
+    launch_checked: Option<Instant>,
+    launch_running: Arc<AtomicBool>,
 }
 
 impl BinUi {
@@ -63,6 +74,9 @@ impl BinUi {
             build: None,
             build_checked: None,
             art: Art::default(),
+            launch_state: Arc::default(),
+            launch_checked: None,
+            launch_running: Arc::default(),
         };
         b.reload(root);
         b
@@ -75,14 +89,28 @@ impl BinUi {
             Some(Ok(c)) => TrustStore::load().state(root, &c.hash),
             _ => TrustState::Unknown,
         };
-        // A sync may have brought new images.
+        // A sync may have brought new images, and changed whether the editor can launch.
         self.art.loaded = false;
+        self.launch_checked = None;
     }
 
-    /// The config, if the repository uses binaries and the user trusts it.
+    /// The project uses binaries, but its builds don't run on this machine (a Windows editor on a Mac).
+    pub fn unsupported_platform(&self) -> Option<Vec<String>> {
+        match &self.cfg {
+            Some(Ok(c)) if !c.config.supports_this_platform() => Some(c.config.platforms.clone()),
+            _ => None,
+        }
+    }
+
+    /// Launch's readiness from the last background check (`None`: not checked yet).
+    pub fn launch_state(&self) -> Option<Result<(), LaunchProblem>> {
+        self.launch_state.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// The config, if the repository uses binaries, they run on this machine, and the user trusts it.
     pub fn active(&self) -> Option<&BinariesConfig> {
         match (&self.cfg, self.trust) {
-            (Some(Ok(c)), TrustState::Trusted) => Some(&c.config),
+            (Some(Ok(c)), TrustState::Trusted) if c.config.supports_this_platform() => Some(&c.config),
             _ => None,
         }
     }
@@ -93,11 +121,25 @@ impl BinUi {
 
     /// Every frame; does real work at most once a second: re-reads this machine's build progress (one small file
     /// and one process check) and loads the project's images when they may have changed.
-    pub fn tick(&mut self, ctx: &egui::Context, root: &Path) {
+    pub fn tick(&mut self, ctx: &egui::Context, repo: &Repo) {
+        let root = repo.root();
         let Some(cfg) = self.active().cloned() else {
             self.build = None;
             return;
         };
+        if self.launch_checked.is_none_or(|t| t.elapsed() >= LAUNCH_RECHECK) && !self.launch_running.swap(true, Ordering::AcqRel) {
+            self.launch_checked = Some(Instant::now());
+            let (r, cfg, state, running, ctx) =
+                (repo.clone(), cfg.clone(), self.launch_state.clone(), self.launch_running.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let res = sync::launch_check(&r, &cfg);
+                if let Ok(mut s) = state.lock() {
+                    *s = Some(res);
+                }
+                running.store(false, Ordering::Release);
+                ctx.request_repaint();
+            });
+        }
         if self.build_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
             self.build_checked = Some(Instant::now());
             self.build = builder::current(&cfg.release_repo, chrono::Utc::now().timestamp());
@@ -157,6 +199,9 @@ impl RepoTab {
     /// Get Latest when the repository uses binaries. Returns `false` to fall through to the normal Get Latest.
     pub(super) fn bin_get_latest(&mut self, settings: &Settings) -> bool {
         self.bin.reload(self.repo.root());
+        if self.bin.unsupported_platform().is_some() {
+            return false;
+        }
         match (&self.bin.cfg, self.bin.trust) {
             (None, _) | (_, TrustState::Declined) => false,
             (Some(Err(e)), _) => {
@@ -173,17 +218,7 @@ impl RepoTab {
                 let mode = settings.pull_mode;
                 let progress = self.bin.progress.clone();
                 self.local.submit(SYNC_JOB, move |r| {
-                    let report = |s: String| {
-                        if let Ok(mut p) = progress.lock() {
-                            *p = Some(s);
-                        }
-                    };
-                    let dirty: Vec<String> = r.status().map(|s| s.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
-                    let src = source::for_repo(r, &cfg.release_repo);
-                    let res = sync::get_latest(r, &cfg, src.as_ref(), &install::cache_root(), mode, &dirty, &report);
-                    if let Ok(mut p) = progress.lock() {
-                        *p = None;
-                    }
+                    let res = run_bin_get_latest(r, &cfg, mode, &progress);
                     Msg::Done { title: "Get Latest".into(), result: res.map(OpOk::Binaries), net: false }
                 });
                 true
@@ -206,6 +241,29 @@ impl RepoTab {
         }
     }
 
+    /// "Run setup": the project's post-sync step for the checked-out version, on its own.
+    pub(super) fn bin_run_setup(&mut self) {
+        let Some(cfg) = self.bin.active().cloned() else { return };
+        let progress = self.bin.progress.clone();
+        self.bin.launch_checked = None;
+        self.local.submit(SETUP_JOB, move |r| {
+            let report = |s: String| {
+                if let Ok(mut p) = progress.lock() {
+                    *p = Some(s);
+                }
+            };
+            let res = sync::run_setup(r, &cfg, &report);
+            if let Ok(mut p) = progress.lock() {
+                *p = None;
+            }
+            Msg::Done {
+                title: "Setup".into(),
+                result: res.map(|_| OpOk::Message("Setup finished; the editor is ready.".into())),
+                net: false,
+            }
+        });
+    }
+
     /// The set-up banner's button: the trust prompt on its own.
     pub(super) fn bin_set_up(&mut self) {
         self.bin.reload(self.repo.root());
@@ -216,6 +274,7 @@ impl RepoTab {
     }
 
     pub(super) fn bin_on_done(&mut self, outcome: BinSyncOutcome) {
+        self.bin.launch_checked = None;
         match outcome {
             BinSyncOutcome::Normal { reason, sync } => {
                 if self.bin.active().is_some() {
@@ -225,7 +284,7 @@ impl RepoTab {
             }
             BinSyncOutcome::UpToDate { waiting: 0 } => self.toast("You already have the latest version, and its build is installed."),
             BinSyncOutcome::UpToDate { waiting } => {
-                self.toast(format!("You're on the newest change that has a build. {waiting} newer change(s) are still building."))
+                self.toast(format!("You're on the newest change that has a build. {waiting} newer change(s) don't have one yet."))
             }
             BinSyncOutcome::Synced { moved, installed, waiting } => {
                 let mut parts = Vec::new();
@@ -238,7 +297,7 @@ impl RepoTab {
                     parts.push(format!("installed build {k}"));
                 }
                 if waiting > 0 {
-                    parts.push(format!("{waiting} newer change(s) are still building"));
+                    parts.push(format!("{waiting} newer change(s) don't have a build yet"));
                 }
                 if parts.is_empty() {
                     parts.push("Up to date".into());
@@ -252,7 +311,7 @@ impl RepoTab {
                     String::new()
                 };
                 self.error(format!(
-                    "No editor build is available for this branch yet, so nothing was changed.{extra}\nAsk a programmer to run the build workflow."
+                    "No editor build is available for this branch yet, so nothing was changed.{extra}\nIf nothing is building, ask a programmer to run the build workflow."
                 ))
             }
             BinSyncOutcome::Blocked { overlap } => self.dialog = Some(Dialog::SyncBlocked(overlap)),
@@ -272,9 +331,12 @@ impl RepoTab {
     pub(super) fn bin_toolbar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let Some(cfg) = self.bin.active() else { return };
         if !cfg.launch.is_empty() {
-            let blocker = sync::launch_blocker(&self.repo, cfg);
-            let tip = blocker.clone().unwrap_or_else(|| format!("Start {}", cfg.launch[0]));
-            let enabled = blocker.is_none() && !self.is_busy();
+            let (ok, tip) = match self.bin.launch_state() {
+                Some(Ok(())) => (true, format!("Start {}", cfg.launch[0])),
+                Some(Err(p)) => (false, p.message),
+                None => (false, "Checking the editor…".to_string()),
+            };
+            let enabled = ok && !self.is_busy();
             let clicked = match &self.bin.art.icon {
                 Some(icon) => {
                     let image =
@@ -288,11 +350,39 @@ impl RepoTab {
                 actions.push(Action::LaunchEditor);
             }
         }
-        if let Some(st) = &self.bin.status {
-            if st.waiting > 0 {
-                ui.label(RichText::new(format!("⏳ {} newer change(s) building", st.waiting)).color(MUTED))
+        let repo_name = cfg.release_repo.clone();
+        let request = |commit: &str| {
+            format!(
+                "Please build the editor for {repo_name} at commit {commit}: on GitHub, open {repo_name} › Actions, pick the binaries build workflow, and use Run workflow with target_sha = {commit}."
+            )
+        };
+        match self.bin.status.as_ref().and_then(|s| s.newer.clone()) {
+            Some(Newer::Building { count }) => {
+                ui.label(RichText::new(format!("⏳ {count} newer change(s) building")).color(MUTED))
                     .on_hover_text("Get Latest stops at the newest change that has a build, and picks these up once they're built.");
             }
+            Some(Newer::Failed { commit, .. }) => {
+                ui.label(RichText::new(format!("{} The newest change's build failed", icon::WARN)).color(YELLOW)).on_hover_text(
+                    "Get Latest keeps you on the newest change that has a working build. Someone needs to fix the build or start it again.",
+                );
+                if ui.small_button("View builds").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://github.com/{repo_name}/actions")));
+                }
+                if ui.small_button("Copy build request").on_hover_text("Copies a message you can send to a programmer.").clicked() {
+                    ui.ctx().copy_text(request(&commit));
+                    actions.push(Action::Toast("Copied. Paste it to whoever maintains the build.".into()));
+                }
+            }
+            Some(Newer::NotIndexed { commit, count }) => {
+                ui.label(RichText::new(format!("⏳ {count} newer change(s) not on the build server yet")).color(MUTED)).on_hover_text(
+                    "The build server hasn't looked at the newest change yet. It usually does within a few minutes of a push; if it doesn't, send a build request.",
+                );
+                if ui.small_button("Copy build request").clicked() {
+                    ui.ctx().copy_text(request(&commit));
+                    actions.push(Action::Toast("Copied. Paste it to whoever maintains the build.".into()));
+                }
+            }
+            None => {}
         }
     }
 
@@ -301,6 +391,16 @@ impl RepoTab {
             let e = e.clone();
             theme::banner(ui, RED, |ui| {
                 ui.label(format!("{} This project's binaries settings are invalid; Get Latest won't install builds. {e}", icon::WARN));
+            });
+            return;
+        }
+        if let Some(platforms) = self.bin.unsupported_platform() {
+            theme::banner(ui, MUTED, |ui| {
+                ui.label(format!(
+                    "{} This project's ready-made editor builds are for {}, not this computer. Get Latest works as for any project here; build the editor yourself.",
+                    icon::INFO,
+                    platforms.join(", ")
+                ));
             });
             return;
         }
@@ -321,10 +421,17 @@ impl RepoTab {
         }
         // The transaction file exists for the whole of a Get Latest, not only after one was cut short. While this tab
         // is running one, say what it's doing; the "didn't finish" warning is only true once nothing is running.
-        if self.local.current().as_deref() == Some(SYNC_JOB) {
+        let job = self.local.current();
+        if job.as_deref() == Some(SYNC_JOB) || job.as_deref() == Some(SETUP_JOB) {
             let line = self.bin.progress_line().unwrap_or_else(|| "Working…".into());
             theme::banner(ui, ACCENT, |ui| {
-                ui.label(format!("{} Getting latest: {line}", icon::INFO));
+                ui.label(format!("{} {}: {line}", icon::INFO, job.unwrap_or_default()));
+            });
+            return;
+        }
+        if sync::pending_txn(&self.repo).is_some() && sync::locked_by_other(&self.repo) {
+            theme::banner(ui, ACCENT, |ui| {
+                ui.label(format!("{} g4v is updating this project in another window. This one waits until it's done.", icon::INFO));
             });
             return;
         }
@@ -340,18 +447,32 @@ impl RepoTab {
             });
             return;
         }
-        let installed =
-            self.bin.status.as_ref().map(|s| s.installed.is_some()).unwrap_or_else(|| install::installed(self.repo.root(), &cfg).is_some());
         let index = self.bin.status.as_ref().is_some_and(|s| s.index);
-        if index && !installed {
-            theme::banner(ui, YELLOW, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("{} The editor isn't installed in this workspace yet.", icon::INFO));
-                    if ui.button(RichText::new("Get Latest to install it").strong()).clicked() {
-                        actions.push(Action::GetLatest);
-                    }
+        if cfg.launch.is_empty() {
+            return;
+        }
+        // Launch's own check says what's wrong and what fixes it.
+        if let Some(Err(p)) = self.bin.launch_state() {
+            let button = match p.fix {
+                LaunchFix::Repair => Some(("Repair editor", Action::GetLatest)),
+                LaunchFix::GetLatest if index => Some(("Get Latest", Action::GetLatest)),
+                LaunchFix::RunSetup => Some(("Run setup", Action::RunBinariesSetup)),
+                _ => None,
+            };
+            if let Some((label, action)) = button {
+                theme::banner(ui, YELLOW, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let mut msg = p.message.clone();
+                        if let Some(c) = msg.get_mut(0..1) {
+                            c.make_ascii_uppercase();
+                        }
+                        ui.label(format!("{} The editor can't be launched: {msg}.", icon::WARN));
+                        if ui.button(RichText::new(label).strong()).clicked() {
+                            actions.push(action);
+                        }
+                    });
                 });
-            });
+            }
         }
     }
 
@@ -477,4 +598,25 @@ impl RepoTab {
         });
         close
     }
+}
+
+/// Get Latest with binaries, as run on the worker: reports progress into `progress` and clears it afterwards.
+pub(super) fn run_bin_get_latest(
+    r: &Repo,
+    cfg: &BinariesConfig,
+    mode: PullMode,
+    progress: &Arc<Mutex<Option<String>>>,
+) -> Result<BinSyncOutcome, String> {
+    let report = |s: String| {
+        if let Ok(mut p) = progress.lock() {
+            *p = Some(s);
+        }
+    };
+    let dirty: Vec<String> = r.status().map(|s| s.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
+    let src = source::for_repo(r, &cfg.release_repo);
+    let res = sync::get_latest(r, cfg, src.as_ref(), &install::cache_root(), mode, &dirty, &report);
+    if let Ok(mut p) = progress.lock() {
+        *p = None;
+    }
+    res
 }

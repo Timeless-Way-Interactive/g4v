@@ -425,9 +425,13 @@ pub fn user_error(cmd: &str, msg: &str) -> GitError {
     GitError { command: cmd.into(), code: None, stderr: msg.into(), stdout: String::new() }
 }
 
-/// Clones `url` into `dest` (including submodules and LFS content).
+/// Clones `url` into `dest` (including LFS content), then the submodules the project says everyone needs — not
+/// every submodule: a private one in `.g4v/submodules.toml`'s `optional` list would stop the clone for anyone
+/// without access to it.
 pub fn clone(url: &str, dest: &Path, log: &CmdLog) -> GitResult<()> {
-    run_global(&[OsStr::new("clone"), OsStr::new("--recurse-submodules"), OsStr::new("--"), OsStr::new(url), dest.as_os_str()], None, log)?;
+    run_global(&[OsStr::new("clone"), OsStr::new("--"), OsStr::new(url), dest.as_os_str()], None, log)?;
+    let repo = super::Repo::open(dest, log.clone()).map_err(|e| user_error("clone", &e.to_string()))?;
+    repo.update_submodules_if_any()?;
     Ok(())
 }
 

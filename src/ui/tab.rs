@@ -113,6 +113,11 @@ pub enum OpOk {
         sync: SyncOutcome,
     },
     Binaries(crate::binaries::BinSyncOutcome),
+    /// "Shelve my edits & get latest" in a project with binaries: the shelf, then the binaries Get Latest.
+    BinariesAfterShelf {
+        shelf: Shelf,
+        outcome: crate::binaries::BinSyncOutcome,
+    },
 }
 
 pub enum Msg {
@@ -176,6 +181,10 @@ pub enum Action {
     TrustBinaries(bool),
     /// The "set up" banner: ask for trust without starting a Get Latest.
     SetUpBinaries,
+    /// Run the project's setup step (engine dependencies) for the checked-out version.
+    RunBinariesSetup,
+    /// Show a short message.
+    Toast(String),
     LaunchEditor,
     ShelveOverlapAndSync(Vec<String>),
     Push,
@@ -846,7 +855,8 @@ impl RepoTab {
                 self.request_fetch();
             }
         }
-        self.bin.tick(ctx, self.repo.root());
+        let repo = self.repo.clone();
+        self.bin.tick(ctx, &repo);
         self.toasts.retain(|t| t.error || t.created.elapsed() < Duration::from_secs(6));
         ctx.request_repaint_after(Duration::from_millis(if focused { 1000 } else { 5000 }));
     }
@@ -1113,6 +1123,13 @@ impl RepoTab {
             OpOk::Message(m) => self.toast(m),
             OpOk::Sync(outcome) => self.on_sync(outcome),
             OpOk::Binaries(outcome) => self.bin_on_done(outcome),
+            OpOk::BinariesAfterShelf { shelf, outcome } => {
+                self.toast(format!(
+                    "Your edits were shelved as \"{}\". Unshelve them from the Shelves tab when you're ready.",
+                    first_line(&shelf.description)
+                ));
+                self.bin_on_done(outcome);
+            }
             OpOk::Submitted { commit, cl, cl_id, push, unlocked, unlock_failed } => {
                 // The change is committed, so the typed description is no longer needed.
                 self.submit_draft = None;
@@ -1230,17 +1247,33 @@ impl RepoTab {
             }
             Action::TrustBinaries(trusted) => self.bin_set_trust(trusted, settings),
             Action::SetUpBinaries => self.bin_set_up(),
+            Action::RunBinariesSetup => self.bin_run_setup(),
+            Action::Toast(t) => self.toast(t),
             Action::LaunchEditor => self.bin_launch(),
             Action::ShelveOverlapAndSync(paths) => {
                 let mode = settings.pull_mode;
                 let branch = self.branch_name();
-                self.local.submit("Shelving and getting latest", move |r| {
+                // In a project with binaries, the same Get Latest as the main button: it stops at the newest change
+                // that has a build and installs it. A plain sync would move past it and leave the old editor.
+                let bin = self.bin.active().cloned();
+                let progress = self.bin.progress.clone();
+                let job = if bin.is_some() { super::binaries::SYNC_JOB } else { "Shelving and getting latest" };
+                self.local.submit(job, move |r| {
                     let res = (|| {
                         let files = fresh_statuses(r, &paths)?;
                         let mut all = paths.clone();
                         all.extend(files.iter().filter_map(|f| f.orig_path.clone()));
                         let shelf = r.create_shelf(&all, &format!("My edits set aside to get latest on {branch}")).map_err(es)?;
                         r.revert_files(&files).map_err(es)?;
+                        if let Some(cfg) = &bin {
+                            return match super::binaries::run_bin_get_latest(r, cfg, mode, &progress) {
+                                Ok(outcome) => Ok(OpOk::BinariesAfterShelf { shelf, outcome }),
+                                Err(e) => Err(format!(
+                                    "{e}\n\nYour edits are safe on the shelf \"{}\"; unshelve them from the Shelves tab.",
+                                    first_line(&shelf.description)
+                                )),
+                            };
+                        }
                         let dirty: Vec<String> = r.status().map(|s| s.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
                         let sync = r.sync(mode, &dirty).map_err(es)?;
                         Ok(OpOk::BlockedResolved { shelf, sync })

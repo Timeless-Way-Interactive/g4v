@@ -10,6 +10,12 @@
 //! * in the backup folder → it was replaced: put the backup back;
 //! * still staged → it was never reached: leave the workspace copy alone;
 //! * neither → it was new: remove it.
+//!
+//! Putting a backup back never consumes it: the file is hard-linked (or copied) into place, and the backup folder
+//! is only deleted once the whole rollback — files, branch, submodules, setup — has finished. So a rollback that is
+//! itself interrupted can simply run again: every step reaches the same result the second time. (Moving the
+//! backup instead would leave a retry seeing neither a backup nor a staged copy, and it would delete the very file
+//! the first attempt restored.)
 
 use super::config::BinariesConfig;
 use super::notes::Note;
@@ -318,7 +324,7 @@ fn installed_manifest_any(root: &Path, cfg: &BinariesConfig) -> Option<Manifest>
     Manifest::parse(&bytes).ok()
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent folder")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
@@ -328,8 +334,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Puts `bak` at `dst` and keeps `bak`: a hard link where possible (same volume, instant), else a copy. Written
+/// under a temporary name first, so `dst` is either the old file or the restored one, never half of either.
+fn put_back(bak: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(".g4v-restore");
+    let tmp = dst.with_file_name(name);
+    let _ = std::fs::remove_file(&tmp);
+    if std::fs::hard_link(bak, &tmp).is_err() {
+        std::fs::copy(bak, &tmp)?;
+    }
+    // rename replaces an existing file on Windows and Unix alike.
+    std::fs::rename(&tmp, dst)
+}
+
 /// Undoes a (possibly partial or crashed) [`swap`] using only what is on disk: the new manifest, the staging
-/// folder and the backup folder. See the module docs for the rule.
+/// folder and the backup folder. See the module docs for the rule. Safe to run any number of times: the backup and
+/// staging folders are left for the caller to delete once its whole rollback has succeeded.
 pub fn restore(root: &Path, cfg: &BinariesConfig, new_manifest: Option<&Manifest>, staging: &Path, backup: &Path) -> Result<(), String> {
     let mut errors = Vec::new();
     // g4v's own record first. The current marker / installed manifest is the swap's (and must go) when the old one
@@ -350,10 +374,7 @@ pub fn restore(root: &Path, cfg: &BinariesConfig, new_manifest: Option<&Manifest
             let Ok(dst) = resolve_inside(root, &f.path) else { continue };
             let bak = backup.join(&f.path);
             if bak.exists() {
-                if dst.exists() {
-                    let _ = std::fs::remove_file(&dst);
-                }
-                if let Err(e) = move_file(&bak, &dst) {
+                if let Err(e) = put_back(&bak, &dst) {
                     errors.push(format!("{}: {e}", dst.display()));
                 }
             } else if !staging.join(&f.path).exists() && dst.is_file() {
@@ -376,10 +397,7 @@ pub fn restore(root: &Path, cfg: &BinariesConfig, new_manifest: Option<&Manifest
             let Ok(rel) = p.strip_prefix(backup) else { continue };
             let rel = rel.to_string_lossy().replace('\\', "/");
             let Ok(dst) = resolve_inside(root, &rel) else { continue };
-            if dst.exists() {
-                let _ = std::fs::remove_file(&dst);
-            }
-            if let Err(e) = move_file(&p, &dst) {
+            if let Err(e) = put_back(&p, &dst) {
                 errors.push(format!("{}: {e}", dst.display()));
             }
         }
@@ -391,7 +409,5 @@ pub fn restore(root: &Path, cfg: &BinariesConfig, new_manifest: Option<&Manifest
         }
         return Err(format!("Some files could not be put back:\n{}", errors.join("\n")));
     }
-    let _ = std::fs::remove_dir_all(backup);
-    let _ = std::fs::remove_dir_all(staging);
     Ok(())
 }

@@ -9,6 +9,7 @@
 //! source_paths     = ["Game/Source", "Game/Plugins", "Game/DungeonBreak.uproject"]
 //! launch           = ["Game/Binaries/Win64/DungeonBreakEditor.exe", "Game/DungeonBreak.uproject"]
 //! post_sync        = { run = ["Sync.ps1", "-DependenciesOnly"], when_changed = ["UnrealEngine"] }
+//! platforms        = ["windows-x86_64"]
 //! ```
 //!
 //! Every path is checked here, when the file is loaded, so the rest of the module can rely on them.
@@ -43,6 +44,10 @@ pub struct BinariesConfig {
     /// A command to run after the workspace moved, when one of `when_changed` changed.
     #[serde(default)]
     pub post_sync: Option<PostSync>,
+    /// `<os>-<arch>` the builds run on (Rust's names: `windows-x86_64`, `macos-aarch64`, `linux-x86_64`, …). Empty:
+    /// any. On any other machine g4v doesn't offer the builds at all: Get Latest works as for any repository.
+    #[serde(default)]
+    pub platforms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -121,6 +126,16 @@ impl BinariesConfig {
         Ok(())
     }
 
+    /// This machine, in the form `platforms` uses.
+    pub fn this_platform() -> String {
+        format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// Whether the builds run on this machine.
+    pub fn supports_this_platform(&self) -> bool {
+        self.platforms.is_empty() || self.platforms.iter().any(|p| p.eq_ignore_ascii_case(&Self::this_platform()))
+    }
+
     pub fn in_install_root(&self, rel: &str) -> bool {
         self.install_roots.iter().any(|root| is_under(rel, root))
     }
@@ -189,5 +204,14 @@ post_sync        = { run = ["Sync.ps1", "-DependenciesOnly"], when_changed = ["U
             assert!(BinariesConfig::parse(&text).is_err(), "accepted: {to}");
         }
         assert!(BinariesConfig::parse(&format!("{GOOD}\nunknown = 1\n")).is_err());
+    }
+
+    #[test]
+    fn platforms_limit_where_builds_are_offered() {
+        assert!(BinariesConfig::parse(GOOD).unwrap().supports_this_platform(), "no list: everywhere");
+        let here = BinariesConfig::parse(&format!("{GOOD}platforms = [\"{}\"]\n", BinariesConfig::this_platform())).unwrap();
+        assert!(here.supports_this_platform());
+        let elsewhere = BinariesConfig::parse(&format!("{GOOD}platforms = [\"plan9-mips\"]\n")).unwrap();
+        assert!(!elsewhere.supports_this_platform());
     }
 }

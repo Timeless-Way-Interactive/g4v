@@ -284,9 +284,32 @@ impl Repo {
             .collect()
     }
 
+    /// Brings submodules to the commits the project pins. Every submodule is initialized and updated, except the
+    /// ones the project marks optional (see [`super::submodules`]): those are updated only where already checked
+    /// out, so a teammate without access to a private one is never blocked by it.
     pub fn update_submodules_if_any(&self) -> GitResult<()> {
-        if self.root().join(".gitmodules").exists() {
+        if !self.root().join(".gitmodules").exists() {
+            return Ok(());
+        }
+        let optional = super::submodules::optional(self.root());
+        if optional.is_empty() {
             self.git().args(["submodule", "update", "--init", "--recursive"]).run()?;
+            return Ok(());
+        }
+        let listing = self
+            .git()
+            .args(["config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"])
+            .ok_codes(&[0, 1])
+            .quiet()
+            .run()?
+            .text();
+        let all = super::submodules::parse_paths(&listing);
+        let (required, present) = super::submodules::split(self.root(), &all, &optional);
+        if !required.is_empty() {
+            self.git().args(["submodule", "update", "--init", "--recursive", "--"]).args(&required).run()?;
+        }
+        if !present.is_empty() {
+            self.git().args(["submodule", "update", "--recursive", "--"]).args(&present).run()?;
         }
         Ok(())
     }

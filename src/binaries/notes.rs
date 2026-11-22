@@ -67,6 +67,12 @@ pub fn fetch(repo: &Repo, remote: &str, notes_ref: &str) -> GitResult<bool> {
     }
 }
 
+/// The note on one commit, if it has a readable one.
+pub fn note_for(repo: &Repo, notes_ref: &str, rev: &str) -> Option<Note> {
+    let out = repo.git().args(["notes"]).arg(format!("--ref={notes_ref}")).args(["show", rev]).quiet().run().ok()?;
+    serde_json::from_str(out.text().trim()).ok()
+}
+
 pub fn exists(repo: &Repo, notes_ref: &str) -> bool {
     repo.git().args(["rev-parse", "--verify", "--quiet"]).arg(notes_ref).quiet().run().is_ok()
 }
