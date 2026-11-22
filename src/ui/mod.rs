@@ -57,6 +57,14 @@ pub struct G4vApp {
     applied_theme: Option<(bool, f32)>,
 }
 
+/// Says that `G4V_GIT` was ignored because the Git it names isn't there.
+fn ignored_git_env_note(value: &std::ffi::OsStr) -> String {
+    format!(
+        "G4V_GIT is set to {}, which doesn't exist, so g4v ignored it. Fix or remove that environment variable.",
+        value.to_string_lossy()
+    )
+}
+
 impl G4vApp {
     pub fn new(cc: &eframe::CreationContext<'_>, open: Vec<PathBuf>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -284,6 +292,10 @@ impl G4vApp {
             ui.label(RichText::new("g4v").size(48.0).strong().color(ACCENT));
             ui.label(RichText::new("Version control for artists, designers and everyone else").size(16.0).color(MUTED));
             ui.add_space(30.0);
+            if let Some(v) = crate::git::ignored_git_env() {
+                ui.label(RichText::new(ignored_git_env_note(v)).color(MUTED));
+                ui.add_space(10.0);
+            }
             if let Err(e) = &self.git {
                 ui.label(RichText::new(e).color(RED));
                 return;
@@ -483,6 +495,9 @@ impl G4vApp {
                         crate::git::GitSource::Env(_) => "the Git named by G4V_GIT",
                     };
                     ui.label(theme::small(format!("Using {using}: {}", self.git.as_deref().unwrap_or("not found"))));
+                    if let Some(v) = crate::git::ignored_git_env() {
+                        ui.label(theme::small(ignored_git_env_note(v)));
+                    }
                     if bundled
                         && ui
                             .checkbox(&mut self.settings.use_system_git, "Use the Git installed on this computer instead (restart g4v to apply)")

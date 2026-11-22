@@ -143,6 +143,30 @@ pub enum GitSource {
 }
 
 static GIT_SOURCE: std::sync::OnceLock<GitSource> = std::sync::OnceLock::new();
+/// A `G4V_GIT` that was ignored because it names a file that isn't there.
+static IGNORED_GIT_ENV: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
+
+/// Whether a `G4V_GIT` value can be run: a command name (looked up on PATH, as with any program) or the path of a
+/// file that exists, with or without its `.exe`. A path into a folder that's gone would otherwise fail every git
+/// command with "The system cannot find the path specified" and never say which Git was meant.
+pub fn env_git_usable(value: &OsStr, is_file: impl Fn(&Path) -> bool) -> bool {
+    let text = value.to_string_lossy();
+    if text.trim().is_empty() {
+        return false;
+    }
+    if !text.contains(['/', '\\', ':']) {
+        return true;
+    }
+    let path = Path::new(value);
+    let mut with_exe = value.to_os_string();
+    with_exe.push(".exe");
+    is_file(path) || (cfg!(windows) && path.extension().is_none() && is_file(Path::new(&with_exe)))
+}
+
+/// The `G4V_GIT` value that was ignored at startup, if any.
+pub fn ignored_git_env() -> Option<&'static OsStr> {
+    IGNORED_GIT_ENV.get().map(OsString::as_os_str)
+}
 
 /// The bundled Git next to the running g4v, if the installer put one there. It carries a marker file so a folder that
 /// merely happens to be called `git` is never used.
@@ -179,7 +203,14 @@ pub fn choose_git_source(
 /// post-sync scripts, the editor and its source control plugin — uses the same Git, Git LFS and credential helper.
 pub fn select_git(prefer_system: bool) -> &'static GitSource {
     GIT_SOURCE.get_or_init(|| {
-        let source = choose_git_source(std::env::var_os("G4V_GIT"), bundled_git_dir(), prefer_system, system_git_works);
+        let env = std::env::var_os("G4V_GIT").filter(|v| {
+            let usable = env_git_usable(v, Path::is_file);
+            if !usable {
+                let _ = IGNORED_GIT_ENV.set(v.clone());
+            }
+            usable
+        });
+        let source = choose_git_source(env, bundled_git_dir(), prefer_system, system_git_works);
         if let GitSource::Bundled(dir) = &source {
             let cmd = dir.join("cmd");
             let current = std::env::var_os("PATH").unwrap_or_default();
@@ -208,12 +239,22 @@ fn git_exe() -> &'static OsStr {
     })
 }
 
+/// Explains a failure to start git: which Git g4v tried to run, and what fixes it.
+fn cannot_start_git(e: &std::io::Error) -> String {
+    let fix = match git_source() {
+        GitSource::Env(_) => "Fix or remove the G4V_GIT environment variable, then restart g4v.",
+        GitSource::Bundled(_) => "Reinstall g4v to restore the Git that comes with it.",
+        GitSource::System => "Install Git from https://git-scm.com and restart g4v.",
+    };
+    format!("Could not run git ({}): {e}. {fix}", Path::new(git_exe()).display())
+}
+
 /// Runs git outside any repository (account commands and the like); stdout, trimmed, or stderr as the error.
 pub fn run_plain(args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(git_exe());
     cmd.args(args).stdin(Stdio::null());
     hide_window(&mut cmd);
-    let o = cmd.output().map_err(|e| e.to_string())?;
+    let o = cmd.output().map_err(|e| cannot_start_git(&e))?;
     if o.status.success() {
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     } else {
@@ -236,7 +277,7 @@ pub fn git_version() -> Result<String, String> {
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(format!("Git was not found on this computer ({e}). Install Git from https://git-scm.com and restart g4v.")),
+        Err(e) => Err(cannot_start_git(&e)),
     }
 }
 
@@ -297,7 +338,7 @@ impl Repo {
         cmd.current_dir(path).args(["rev-parse", "--is-bare-repository", "--show-toplevel", "--absolute-git-dir"]);
         apply_safe_env(&mut cmd);
         hide_window(&mut cmd);
-        let out = cmd.output().map_err(|e| anyhow::anyhow!("Could not run git: {e}"))?;
+        let out = cmd.output().map_err(|e| anyhow::anyhow!(cannot_start_git(&e)))?;
         if !out.status.success() {
             anyhow::bail!("{} is not inside a Git repository.\n{}", path.display(), String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -517,7 +558,7 @@ impl<'a> GitCmd<'a> {
 
         let fail = |stderr: String, code: Option<i32>, stdout: String| GitError { command: display.clone(), code, stderr, stdout };
 
-        let mut child = cmd.spawn().map_err(|e| fail(format!("Could not start git: {e}"), None, String::new()))?;
+        let mut child = cmd.spawn().map_err(|e| fail(cannot_start_git(&e), None, String::new()))?;
         // Write stdin from a helper thread so large inputs can't deadlock with stdout.
         let writer = match (self.stdin, child.stdin.take()) {
             (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || pipe.write_all(&data))),
@@ -581,12 +622,8 @@ pub fn run_global(args: &[&OsStr], cwd: Option<&Path>, log: &CmdLog) -> GitResul
     apply_safe_env(&mut cmd);
     hide_window(&mut cmd);
     let display = format!("git {}", args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-    let out = cmd.output().map_err(|e| GitError {
-        command: display.clone(),
-        code: None,
-        stderr: format!("Could not start git: {e}"),
-        stdout: String::new(),
-    })?;
+    let out =
+        cmd.output().map_err(|e| GitError { command: display.clone(), code: None, stderr: cannot_start_git(&e), stdout: String::new() })?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     log.push(CmdLogEntry {
         time: chrono::Local::now(),
@@ -623,5 +660,21 @@ mod source_tests {
         assert_eq!(choose_git_source(None, b(), true, || false), GitSource::Bundled(PathBuf::from("C:/g4v/git")));
         // No bundle: PATH.
         assert_eq!(choose_git_source(None, None, false, || false), GitSource::System);
+    }
+
+    #[test]
+    fn env_git_must_exist() {
+        let only = |want: &'static str| move |p: &Path| p == Path::new(want);
+        // A command name is looked up on PATH when it runs, like any program.
+        assert!(env_git_usable(OsStr::new("git"), |_| false));
+        // A path must name a file that's there (the reported case: a folder that no longer exists).
+        assert!(!env_git_usable(OsStr::new(r"C:\Old Git\cmd\git.exe"), |_| false));
+        assert!(env_git_usable(OsStr::new(r"C:\Git\cmd\git.exe"), only(r"C:\Git\cmd\git.exe")));
+        assert!(env_git_usable(OsStr::new("/usr/bin/git"), only("/usr/bin/git")));
+        // Windows runs `git` as `git.exe`.
+        assert_eq!(env_git_usable(OsStr::new(r"C:\Git\cmd\git"), only(r"C:\Git\cmd\git.exe")), cfg!(windows));
+        // Empty or blank is no Git at all.
+        assert!(!env_git_usable(OsStr::new(""), |_| true));
+        assert!(!env_git_usable(OsStr::new("  "), |_| true));
     }
 }

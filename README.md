@@ -143,7 +143,7 @@ installed to `<install dir>\git`, with their own system config: LFS filters, `cr
 installed separately is unaffected.
 
 g4v uses that Git unless `G4V_GIT` names another, or *Settings › Use the Git installed on this computer* is on (after
-a restart). It also puts it first on `PATH` for everything g4v starts: git hooks, a project's post-sync scripts and
+a restart). A `G4V_GIT` path that doesn't exist is ignored, and the start screen and Settings say so. It also puts it first on `PATH` for everything g4v starts: git hooks, a project's post-sync scripts and
 the editor. *File › GitHub account…* shows who is signed in and signs in or out through the bundled Credential
 Manager. Sign-ins are stored in Windows Credential Manager and shared with any other Git on the machine.
 
