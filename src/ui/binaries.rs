@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The worker job name of a binaries Get Latest.
+const SYNC_JOB: &str = "Getting latest";
 const LAUNCH_ICON: &str = ".g4v/launch-icon.png";
 const BUILD_BANNER: &str = ".g4v/build-banner.png";
 /// Larger images are ignored rather than uploaded as textures.
@@ -170,7 +172,7 @@ impl RepoTab {
                 let cfg = c.config.clone();
                 let mode = settings.pull_mode;
                 let progress = self.bin.progress.clone();
-                self.local.submit("Getting latest", move |r| {
+                self.local.submit(SYNC_JOB, move |r| {
                     let report = |s: String| {
                         if let Ok(mut p) = progress.lock() {
                             *p = Some(s);
@@ -316,6 +318,15 @@ impl RepoTab {
         let Some(cfg) = self.bin.active().cloned() else { return };
         if let Some(p) = self.bin.build.clone() {
             self.build_bar(ui, &p);
+        }
+        // The transaction file exists for the whole of a Get Latest, not only after one was cut short. While this tab
+        // is running one, say what it's doing; the "didn't finish" warning is only true once nothing is running.
+        if self.local.current().as_deref() == Some(SYNC_JOB) {
+            let line = self.bin.progress_line().unwrap_or_else(|| "Working…".into());
+            theme::banner(ui, ACCENT, |ui| {
+                ui.label(format!("{} Getting latest: {line}", icon::INFO));
+            });
+            return;
         }
         if let Some(t) = sync::pending_txn(&self.repo) {
             let text = sync::describe_incomplete(&t);
