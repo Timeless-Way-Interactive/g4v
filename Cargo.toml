@@ -1,6 +1,6 @@
 [package]
 name = "g4v"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "A friendly, P4V-style visual client for Git with changelists, shelves, LFS locks and out-of-date indicators."
 license = "MIT"

@@ -122,6 +122,27 @@ fn new_manifest_path(repo: &Repo) -> PathBuf {
     work_dir(repo).join("new-manifest.json")
 }
 
+fn check_launcher_transaction(repo: &Repo) -> Result<(), String> {
+    let message = "Launch.bat has an interrupted editor installation. Run Launch.bat to finish recovery, then retry.";
+    if repo.meta_dir().join("launcher-install").try_exists().map_err(|e| e.to_string())? {
+        return Err(message.into());
+    }
+    // Older launchers stored their backups in the workspace. Never modify those from G4V.
+    for entry in std::fs::read_dir(repo.root()).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .and_then(|n| n.strip_prefix(".binwork-"))
+            .is_some_and(|key| key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+            && entry.path().join("backup").is_dir()
+        {
+            return Err(message.into());
+        }
+    }
+    Ok(())
+}
+
 pub fn pending_txn(repo: &Repo) -> Option<Txn> {
     std::fs::read(txn_path(repo)).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
@@ -244,6 +265,7 @@ fn run_setup_for(repo: &Repo, cfg: &BinariesConfig, rev: &str, report: Report) -
 /// "Run setup": the post-sync command for the checked-out commit, on its own.
 pub fn run_setup(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<(), String> {
     let _lock = lock_workspace(repo)?;
+    check_launcher_transaction(repo)?;
     if pending_txn(repo).is_some() {
         return Err("The last Get Latest didn't finish; Get Latest first.".into());
     }
@@ -512,6 +534,7 @@ pub fn recover(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<bool
 }
 
 fn recover_locked(repo: &Repo, cfg: &BinariesConfig, report: Report) -> Result<bool, String> {
+    check_launcher_transaction(repo)?;
     match pending_txn(repo) {
         Some(t) => rollback(repo, cfg, &t, report).map(|_| true),
         None => Ok(false),
@@ -714,14 +737,21 @@ fn problem(message: impl Into<String>, fix: LaunchFix) -> Result<(), LaunchProbl
 /// whole, the build the one this version of the project needs, and the setup step done for this version. A
 /// programmer's own build (local source edits, or no g4v install) is theirs: only its presence is checked.
 pub fn launch_check(repo: &Repo, cfg: &BinariesConfig) -> Result<(), LaunchProblem> {
+    if locked_by_other(repo) {
+        return problem(LOCKED, LaunchFix::None);
+    }
+    check_launch_files(repo, cfg)
+}
+
+fn check_launch_files(repo: &Repo, cfg: &BinariesConfig) -> Result<(), LaunchProblem> {
+    if let Err(e) = check_launcher_transaction(repo) {
+        return problem(e, LaunchFix::None);
+    }
     if cfg.launch.is_empty() {
         return problem("this project doesn't say what to launch", LaunchFix::None);
     }
     // Read once: a Get Latest finishing between two reads would otherwise make the second one come back empty.
     if let Some(txn) = pending_txn(repo) {
-        if locked_by_other(repo) {
-            return problem(LOCKED, LaunchFix::None);
-        }
         return problem(describe_incomplete(&txn), LaunchFix::GetLatest);
     }
     match resolve_inside(repo.root(), &cfg.launch[0]) {
@@ -760,9 +790,8 @@ pub fn launch_blocker(repo: &Repo, cfg: &BinariesConfig) -> Option<String> {
 }
 
 pub fn launch(repo: &Repo, cfg: &BinariesConfig) -> Result<(), String> {
-    if let Some(why) = launch_blocker(repo, cfg) {
-        return Err(format!("Can't launch: {why}"));
-    }
+    let _lock = lock_workspace(repo)?;
+    check_launch_files(repo, cfg).map_err(|p| format!("Can't launch: {}", p.message))?;
     let mut c = program(repo, &cfg.launch)?;
     c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     c.spawn().map(|_| ()).map_err(|e| format!("Could not start {}: {e}", cfg.launch[0]))

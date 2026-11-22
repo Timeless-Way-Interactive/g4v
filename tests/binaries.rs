@@ -511,6 +511,24 @@ fn a_second_instance_waits_for_the_workspace_lock() {
     get_latest(&w, &r, &cfg).unwrap();
 }
 
+#[test]
+fn launcher_recovery_precedes_get_latest_and_launch() {
+    let w = World::standard();
+    let r = w.clone("artist");
+    let cfg = config(false);
+    let old_head = head(&r);
+    for path in [r.meta_dir().join("launcher-install"), r.abs(".binwork-0123456789abcdef/backup")] {
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(get_latest(&w, &r, &cfg).unwrap_err().contains("Launch.bat"));
+        assert!(sync::launch_check(&r, &cfg).unwrap_err().message.contains("Launch.bat"));
+        assert_eq!(head(&r), old_head);
+        std::fs::remove_dir(&path).unwrap();
+    }
+    std::fs::create_dir(r.abs(".binwork-art-backup")).unwrap();
+    get_latest(&w, &r, &cfg).unwrap();
+    assert!(r.abs(".binwork-art-backup").is_dir());
+}
+
 /// Review finding: a private submodule (no access) must not block clone or Get Latest for everyone else.
 #[test]
 fn an_optional_submodule_without_access_never_blocks_clone_or_get_latest() {
